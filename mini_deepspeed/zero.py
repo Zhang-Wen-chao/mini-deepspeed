@@ -65,12 +65,22 @@ class ZeroOptimizer:
     model for an engine forward/backward pair before releasing it again.
     """
 
-    def __init__(self, parameters: Iterable[nn.Parameter], config: ZeroConfig):
+    def __init__(
+        self,
+        parameters: Iterable[nn.Parameter],
+        config: ZeroConfig,
+        buffers: Iterable[torch.Tensor] = (),
+    ):
         self.config = config
         self._distributed = dist.is_available() and dist.is_initialized()
         self.rank = dist.get_rank() if self._distributed else 0
         self.world_size = dist.get_world_size() if self._distributed else 1
-        self.layout = FlatParameterLayout(parameters, self.world_size)
+        self.layout = FlatParameterLayout(
+            parameters,
+            self.world_size,
+            buffers=buffers,
+            reject_frozen_aliases=(config.stage == 3),
+        )
         self._synchronize_initial_parameters()
         self.step_count = 0
         self._last_sync = "none (single process)"
@@ -376,8 +386,8 @@ class ZeroOptimizer:
             self._invalidate_stage3()
             if preexisting:
                 raise RuntimeError(
-                    "ZeRO-3 found pre-existing trainable gradients before engine.backward(); "
-                    "a graph was backpropagated outside the engine; all ranks must reset together"
+                    "ZeRO-3 found pre-existing trainable gradients; direct backward or external "
+                    "gradient injection is unsupported; all ranks must reset together"
                 )
             raise RuntimeError(
                 "ZeRO-3 forward or gradient state failed on another rank; all ranks must reset together"

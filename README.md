@@ -89,7 +89,12 @@ gradient contribution, where `torch.optim.AdamW` compounds both in-place
 updates; Stage 3 would additionally break such aliases outright when it
 replaces parameter storage. Non-contiguous parameters that own their full
 storage (for example `nn.Parameter(tensor.t())`) are accepted and updated
-exactly like `torch.optim.AdamW`.
+exactly like `torch.optim.AdamW`. A trainable `Parameter` sharing storage
+with a *frozen* `Parameter` or a registered buffer (for example a frozen copy
+kept as an alias) is accepted in Stages 0-2, where the frozen alias follows
+the in-place updates exactly like `torch.optim.AdamW`; Stage 3 rejects it at
+initialization, because replacing parameter storage would silently leave the
+frozen tensor reading stale weights.
 
 ## Run locally
 

@@ -72,7 +72,12 @@ would end up with only the last write-back, silently dropping the other
 parameter's gradient contribution (`torch.optim.AdamW` compounds both in-place
 updates), and Stage 3 would break the aliases outright by replacing parameter
 storage. Non-contiguous parameters that own their full storage remain
-supported because the flat vector stores logical row-major values.
+supported because the flat vector stores logical row-major values. A trainable
+`Parameter` aliasing a *frozen* `Parameter` or a registered buffer is accepted
+in Stages 0-2 (the frozen alias follows the in-place updates exactly like
+`torch.optim.AdamW`); Stage 3 rejects it at initialization, because replacing
+parameter storage would silently leave the frozen tensor reading stale
+weights.
 
 ## Stage-2 bucket lifecycle
 

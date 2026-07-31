@@ -156,6 +156,49 @@ def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
             mds.initialize(ParameterView(), {"zero_stage": stage})
 
 
+def test_stage_three_rejects_frozen_parameter_and_buffer_aliases() -> None:
+    class FrozenAlias(nn.Module):
+        def __init__(self, as_buffer: bool, slice_alias: bool) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4))
+            frozen = self.weight[:2].detach() if slice_alias else self.weight.detach()
+            if as_buffer:
+                self.register_buffer("frozen", frozen)
+            else:
+                self.frozen = nn.Parameter(frozen, requires_grad=False)
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return (inputs * self.weight).sum() + self.frozen.sum()
+
+    for as_buffer in (False, True):
+        for slice_alias in (False, True):
+            model = FrozenAlias(as_buffer, slice_alias)
+            # Stages 0-2 keep full storage and write updates back with copy_,
+            # so the frozen alias follows the trainable parameter exactly like
+            # torch.optim.AdamW. Only Stage 3 breaks the alias by replacing
+            # parameter storage.
+            torch.manual_seed(31)
+            reference = FrozenAlias(as_buffer, slice_alias)
+            inputs, targets = torch.randn(5, 4), torch.randn(())
+            reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=2e-3, weight_decay=0.1)
+            F.mse_loss(reference(inputs), targets).backward()
+            reference_optimizer.step()
+            expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
+            for stage in (0, 1, 2):
+                torch.manual_seed(31)
+                engine_model = FrozenAlias(as_buffer, slice_alias)
+                engine = mds.initialize(
+                    engine_model, {"zero_stage": stage, "lr": 2e-3, "weight_decay": 0.1}
+                )
+                engine.zero_grad()
+                engine.backward(F.mse_loss(engine(inputs), targets))
+                engine.step()
+                actual = torch.cat([parameter.detach().reshape(-1) for parameter in engine_model.parameters()])
+                torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+            with pytest.raises(ValueError, match="frozen Parameter or buffer"):
+                mds.initialize(FrozenAlias(as_buffer, slice_alias), {"zero_stage": 3})
+
+
 def test_noncontiguous_parameters_are_accepted_and_match_adamw() -> None:
     class NonContiguous(nn.Module):
         def __init__(self) -> None:

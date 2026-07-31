@@ -25,9 +25,16 @@ class FlatParameterLayout:
     a model never receives artificial parameter values.
     """
 
-    def __init__(self, parameters: Iterable[nn.Parameter], world_size: int):
-        source = tuple(parameter for parameter in parameters if parameter.requires_grad)
-        self._validate_parameter_storage(source)
+    def __init__(
+        self,
+        parameters: Iterable[nn.Parameter],
+        world_size: int,
+        buffers: Iterable[torch.Tensor] = (),
+        reject_frozen_aliases: bool = False,
+    ):
+        all_parameters = tuple(parameters)
+        source = tuple(parameter for parameter in all_parameters if parameter.requires_grad)
+        self._validate_parameter_storage(source, alias_scope=(*all_parameters, *buffers), reject_frozen_aliases=reject_frozen_aliases)
         self.parameters = source
         if not self.parameters:
             raise ValueError("ZeRO requires at least one trainable parameter")
@@ -47,7 +54,11 @@ class FlatParameterLayout:
         self.padded_numel = self.shard_numel * world_size
 
     @staticmethod
-    def _validate_parameter_storage(parameters: tuple[nn.Parameter, ...]) -> None:
+    def _validate_parameter_storage(
+        parameters: tuple[nn.Parameter, ...],
+        alias_scope: tuple[torch.Tensor, ...],
+        reject_frozen_aliases: bool,
+    ) -> None:
         """Reject parameters whose flat ownership would be silently wrong.
 
         Every element of the flat vector is owned and updated independently,
@@ -56,14 +67,22 @@ class FlatParameterLayout:
         break that model: the shared region would receive only the last
         write-back, silently dropping the other parameter's gradient
         contribution, while ``torch.optim.AdamW`` compounds both in-place
-        updates. Stage 3 additionally replaces parameter storage during
-        ``materialize``/``release``, which would break aliases outright.
-        Non-contiguous parameters that own their whole storage (for example
-        ``nn.Parameter(tensor.t())``) stay supported: the flat vector stores
-        their logical row-major values.
+        updates. Non-contiguous parameters that own their whole storage (for
+        example ``nn.Parameter(tensor.t())``) stay supported: the flat vector
+        stores their logical row-major values.
+
+        ``reject_frozen_aliases`` additionally rejects trainable parameters
+        that share storage with frozen Parameters or registered buffers. The
+        frozen alias is only ever read and updated through the trainable
+        parameter, so Stages 0-2 (which keep full storage and write back with
+        ``copy_``) preserve it exactly like ``torch.optim.AdamW``. Stage 3
+        replaces parameter storage during ``materialize``/``release``, which
+        would silently break the alias: the frozen tensor would keep reading
+        the initial storage while the trainable parameter evolves.
         """
         seen_ids: set[int] = set()
         spans: list[tuple[int, int]] = []
+        owned_ids = {id(parameter) for parameter in parameters}
         for parameter in parameters:
             if id(parameter) in seen_ids:
                 raise ValueError("ZeRO parameter iterable must not contain the same Parameter twice")
@@ -80,6 +99,21 @@ class FlatParameterLayout:
             if any(start < other_end and other_start < end for other_start, other_end in spans):
                 raise ValueError("ZeRO does not support Parameter views or shared storage")
             spans.append((start, end))
+            if reject_frozen_aliases:
+                for other in alias_scope:
+                    if id(other) in owned_ids or id(other) == id(parameter):
+                        continue
+                    if other.layout != torch.strided or other.numel() == 0:
+                        continue
+                    other_storage = other.untyped_storage()
+                    other_start = other_storage.data_ptr()
+                    other_end = other_start + other_storage.nbytes()
+                    if start < other_end and other_start < end:
+                        raise ValueError(
+                            "ZeRO-3 does not support a trainable Parameter sharing storage with a "
+                            "frozen Parameter or buffer; the alias would break when parameter "
+                            "storage is replaced"
+                        )
 
     @property
     def device(self) -> torch.device:
