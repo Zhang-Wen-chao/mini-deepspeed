@@ -64,12 +64,12 @@ class ZeroOptimizer:
     Stage 3 also shards parameters at rest, eagerly all-gathering the complete
     model for an engine forward/backward pair before releasing it again.
 
-    Stages 0-2 accept an iterable of trainable parameters. Stage 3 instead
-    requires the owning ``nn.Module`` so it can inspect the complete registered
-    Parameter and buffer universe before it takes ownership of parameter
-    storage. Accepting caller-supplied parameter and buffer iterables there
-    would let an incomplete iterable hide a storage alias that ``materialize``
-    and ``release`` would silently break.
+    Stages 0-2 accept either a parameter iterable or an ``nn.Module``. Stage 3
+    instead requires the owning ``nn.Module`` so it can inspect the complete
+    registered Parameter and buffer universe before it takes ownership of
+    parameter storage. Accepting caller-supplied parameter and buffer iterables
+    there would let an incomplete iterable hide a storage alias that
+    ``materialize`` and ``release`` would silently break.
     """
 
     def __init__(
