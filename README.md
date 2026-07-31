@@ -2,12 +2,19 @@
 
 `mini-deepspeed` is an independent, pure-PyTorch teaching project for the
 state-partitioning core of DeepSpeed ZeRO. It deliberately has a different
-boundary from [`mini-megatron`](../mini-megatron): Megatron-style projects are
-about model parallelism and large-model execution, while this repository asks
-which training states must be retained by each *data-parallel* replica.
+boundary from Megatron-style projects: those focus on model parallelism and
+large-model execution, while this repository asks which training states must
+be retained by each *data-parallel* replica.
 
 The first version implements a compact AdamW training engine for ZeRO Stages
 0 through 3. It has no dependency on DeepSpeed or on `mini-megatron`.
+
+> **Scope.** This is a teaching implementation, not a production DeepSpeed
+> ZeRO-3 replacement. In particular, its Stage 3 eagerly gathers and releases
+> the entire model for each forward/backward pair; it does not implement
+> layer-wise scheduling, prefetch, communication/compute overlap, mixed
+> precision, offload, sharded checkpoints, general autograd support, or
+> production-grade fault tolerance.
 
 ## What each stage owns
 
@@ -109,9 +116,10 @@ to accept a parameter iterable.
 Requires Python 3.10+ and PyTorch 2.1+.
 
 ```bash
-cd /path/to/mini-deepspeed
-python3 -m pip install -e '.[dev]'
-python3 -m pytest -q
+git clone https://github.com/Zhang-Wen-chao/mini-deepspeed.git
+cd mini-deepspeed
+python -m pip install -e '.[dev]'
+python -m pytest -q
 
 # Two CPU/Gloo ranks
 torchrun --standalone --nproc_per_node=2 examples/train_toy.py --zero-stage 3 --device cpu
@@ -126,12 +134,13 @@ slice, so it is more communication-heavy than native reduce-scatter. NCCL uses
 PyTorch's native `reduce_scatter_tensor` path. Other distributed backends are
 explicitly rejected.
 
-## L20 multi-GPU run
+## Multi-GPU / NCCL validation
 
-The `experiment` experiment container requires an explicit loopback
-rendezvous rather than `torchrun --standalone`. Its current reliable settings
-are `NCCL_SHM_DISABLE=1`, `CUDA_DEVICE_MAX_CONNECTIONS=1`, and loopback
-network-interface selection for Gloo and NCCL.
+The following is a reproducible single-node NCCL example. Use an explicit
+loopback rendezvous if `torchrun --standalone` is unreliable in your container
+or hostname setup. The environment variables below were required by the
+recorded L20 validation environment; treat them as environment-specific
+workarounds, not universal requirements.
 
 ```bash
 export NCCL_SHM_DISABLE=1
@@ -145,15 +154,16 @@ torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=296
 torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29700 \
   examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
 
-# Four L20s: exercise non-divisible shards and all ZeRO stages.
+# Four GPUs: exercise non-divisible shards and all ZeRO stages.
 torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29741 \
   examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
 ```
 
-An L20/NCCL four-rank run completed the equivalence check with native
-`reduce_scatter_tensor`: ZeRO-1/2/3 all matched ZeRO-0 after four steps. For
-the 21,768-parameter toy model, the reported logical per-rank retained
-model-state elements were:
+On 2026-07-31, a four-L20, four-rank NCCL run completed the equivalence check
+with native `reduce_scatter_tensor`: ZeRO-1/2/3 all matched ZeRO-0 after four
+steps. This is an environment-bound record, not a performance or portability
+claim. For the 21,768-parameter toy model, the reported logical per-rank
+retained model-state elements were:
 
 | Stage | Parameters | Gradients | Adam states | Total |
 | --- | ---: | ---: | ---: | ---: |
@@ -205,10 +215,10 @@ isolated validation environment and is not a runtime dependency of this project.
 
 ## Scope and next work
 
-This is a teaching engine, not a drop-in DeepSpeed replacement. It excludes
-configuration compatibility, tensor/pipeline parallelism, checkpoint sharding,
-mixed precision, gradient clipping, CPU/NVMe offload, and ZeRO-3 layer-wise
-prefetch, communication overlap, or layer-at-a-time parameter release.
+This teaching engine excludes configuration compatibility, tensor/pipeline
+parallelism, checkpoint sharding, mixed precision, gradient clipping,
+CPU/NVMe offload, and ZeRO-3 layer-wise prefetch, communication overlap, or
+layer-at-a-time parameter release.
 In particular, Stage-3 checkpoint save/load is deliberately rejected until a
 dedicated (probably sharded) format is implemented.
 
