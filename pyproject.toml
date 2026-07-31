@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-deepspeed"
+version = "0.1.0"
+description = "A small pure-PyTorch teaching implementation of ZeRO-0/1/2"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1,<3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
