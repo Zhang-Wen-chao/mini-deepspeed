@@ -61,6 +61,11 @@ def _require_deepspeed() -> Any:
     # collectives, or optimizer semantics.
     import deepspeed.utils.nvtx as nvtx
 
+    if not hasattr(nvtx, "enable_nvtx"):
+        raise RuntimeError(
+            "This DeepSpeed version does not expose deepspeed.utils.nvtx.enable_nvtx; "
+            "use a compatible validation environment or update this annotation-only workaround."
+        )
     nvtx.enable_nvtx = False
     return deepspeed
 

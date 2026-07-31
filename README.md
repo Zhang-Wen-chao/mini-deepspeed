@@ -193,13 +193,15 @@ ZeRO-0/1/2/3. It asserts equal replicated initial parameters before training and
 compares every post-update parameter vector element by element. The DeepSpeed
 loop follows its public GAS protocol: it calls `engine.step()` after every
 microbatch and asserts the documented accumulation boundary and `global_steps`
-behavior. The L20 result passed for DeepSpeed 0.19.3 and PyTorch 2.10.0a0 on
-both 2 and 4 GPUs; the four-GPU maximum absolute error was at most `1.490e-08`
-for ZeRO-0/1/2 and `7.451e-09` for ZeRO-3. The validation script disables
-DeepSpeed NVTX annotations only, to avoid an NVTX-domain API incompatibility in
-the current container; this does not change model, collective, or optimizer
-behavior. DeepSpeed is installed only in an isolated validation environment and
-is not a runtime dependency of this project.
+behavior. On 2026-07-31, the code committed as `b9de653` passed this strengthened
+three-update check on four L20 GPUs with DeepSpeed 0.19.3, PyTorch
+`2.10.0a0+a36e1d39eb.nv26.01.42222806`, and CUDA 13.1: the maximum absolute
+error was `1.490e-08` for ZeRO-0/1/2 and `7.451e-09` for ZeRO-3. This is
+environment-bound evidence, not a claim about other hardware, models, or longer
+runs. The validation script disables DeepSpeed NVTX annotations only, to avoid
+an NVTX-domain API incompatibility in that container; this does not change
+model, collective, or optimizer behavior. DeepSpeed is installed only in an
+isolated validation environment and is not a runtime dependency of this project.
 
 ## Scope and next work
 
