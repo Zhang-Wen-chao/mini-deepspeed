@@ -31,7 +31,7 @@ class _DivisibleRegressor(nn.Module):
 
 
 class _RankConditionalRegressor(nn.Module):
-    """Lets one rank omit every parameter to test coordinated ZeRO-3 failure."""
+    """Lets one rank fail in a rank-local way to test coordinated ZeRO-3 failure."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -139,7 +139,13 @@ def _failure_worker(rank: int, world_size: int, init_file: str, result_file: str
             if mode == "raise":
                 engine(inputs)
             else:
-                engine.backward(F.mse_loss(engine(inputs), targets))
+                output = engine(inputs)
+                if mode == "detached" and rank == 1:
+                    # rank 1's own loss.backward() raises inside the engine.
+                    loss = F.mse_loss(output.detach(), targets)
+                else:
+                    loss = F.mse_loss(output, targets)
+                engine.backward(loss)
         assert all(parameter.numel() == 0 for parameter in model.parameters())
 
         # A coordinated zero_grad makes the engine usable again on every rank.
@@ -158,7 +164,7 @@ def _failure_worker(rank: int, world_size: int, init_file: str, result_file: str
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["skip", "raise"])
+@pytest.mark.parametrize("mode", ["skip", "raise", "detached"])
 def test_stage_three_rank_local_failure_is_coordinated(mode: str) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)

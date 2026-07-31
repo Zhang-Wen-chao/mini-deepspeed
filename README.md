@@ -60,7 +60,10 @@ ZeRO-3 deliberately has a narrower lifecycle: one `engine.forward()` must be
 followed by one `engine.backward(loss)`. It gathers the full model for that
 pair, then releases complete parameter tensors. `engine.parameter_vector()`
 temporarily gathers a detached full vector for testing or inspection. If a
-forward result will not be backpropagated, call `engine.abort_forward()`.
+forward result will not be backpropagated, call `engine.abort_forward()`. In a
+distributed launch `abort_forward()` is a coordinated call: every rank must
+call it together, otherwise the ranks that call it block while the peers
+proceed.
 
 In distributed Stage 3, an ordinary rank-local module-forward failure or a
 backward with missing trainable gradients is detected before the next
@@ -71,13 +74,21 @@ collective schedule; rank-divergent user control flow can still deadlock any
 synchronous collective program.
 
 Stage 3 intentionally has no checkpoint format yet. `engine.state_dict()`,
-`engine.load_state_dict()`, and direct `engine.module.state_dict()` /
-`load_state_dict()` raise rather than silently serializing the empty parameter
-placeholders held between iterations. Ordinary tied weights (two module
-attributes referring to the *same* `Parameter`) are supported because PyTorch
-deduplicates `module.parameters()`. Independently constructed `Parameter`
-views or distinct parameters sharing storage are rejected, since replacing
-Stage-3 parameter storage could otherwise silently break their aliasing.
+`engine.load_state_dict()`, and `state_dict()` / `load_state_dict()` on the
+module or any of its submodules raise rather than silently serializing the
+empty parameter placeholders held between iterations. `torch.save(module)`
+(pickle) and `copy.deepcopy(module)` bypass that guard and would serialize
+empty tensors, so they must not be used between iterations. Ordinary tied
+weights (two module attributes referring to the *same* `Parameter`) are
+supported because PyTorch deduplicates `module.parameters()`. Independently
+constructed `Parameter` views or distinct parameters sharing storage are
+rejected in every stage: the flat layout updates each parameter independently,
+so a shared region would keep only the last write-back and silently lose one
+gradient contribution, where `torch.optim.AdamW` compounds both in-place
+updates; Stage 3 would additionally break such aliases outright when it
+replaces parameter storage. Non-contiguous parameters that own their full
+storage (for example `nn.Parameter(tensor.t())`) are accepted and updated
+exactly like `torch.optim.AdamW`.
 
 ## Run locally
 
@@ -148,6 +159,11 @@ launch and compares the parameter vector after *every* step. Its Stage-3
 default is a pure absolute threshold (`rtol=0`, `atol=3e-7`), rather than a
 broad relative tolerance; the four-L20, four-step run observed a maximum
 absolute difference of `2.431e-07` from the different FP32 reduction trees.
+That default is calibrated to the documented L20 configuration (`lr=1e-3`,
+four steps); other learning rates, step counts, or GPUs change how the
+reduction-tree noise propagates through AdamW, so re-calibrate
+`--stage3-atol` on the printed `max_abs_error_over_steps` before relying on
+it.
 
 `examples/compare_deepspeed.py` is the external reference check. It runs the
 same model, per-rank deterministic inputs, AdamW configuration (including

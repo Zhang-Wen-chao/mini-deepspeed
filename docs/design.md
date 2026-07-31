@@ -57,13 +57,21 @@ while peers block in a later collective; it cannot make arbitrary
 rank-divergent engine calls safe, which is a fundamental constraint of
 synchronous collectives.
 
-There is no Stage-3 checkpoint API. Both engine and direct module state-dict
-save/load calls are explicitly rejected while no sharded format exists, instead
-of serializing empty placeholders between iterations. The flat layout supports
-normal weight tying where PyTorch exposes one `Parameter` object once through
-`module.parameters()`. It rejects distinct `Parameter` objects that are views
-or share storage, because Stage-3 materialization replaces parameter storage
-and cannot preserve those aliases safely.
+There is no Stage-3 checkpoint API. State-dict save/load is explicitly
+rejected on the engine, on the module, and on every submodule while no sharded
+format exists, instead of serializing empty placeholders between iterations.
+That guard is registered as `state_dict` pre-hooks on all submodules; pickling
+the module (`torch.save(module)`) or `copy.deepcopy(module)` does not go
+through `state_dict` and would serialize the empty placeholders, so those
+paths are documented as unsupported between iterations. The flat layout supports normal weight tying where PyTorch exposes one
+`Parameter` object once through `module.parameters()`. It rejects distinct
+`Parameter` objects that are views or share storage in every stage: the flat
+vector owns and updates each parameter independently, so the shared region
+would end up with only the last write-back, silently dropping the other
+parameter's gradient contribution (`torch.optim.AdamW` compounds both in-place
+updates), and Stage 3 would break the aliases outright by replacing parameter
+storage. Non-contiguous parameters that own their full storage remain
+supported because the flat vector stores logical row-major values.
 
 ## Stage-2 bucket lifecycle
 

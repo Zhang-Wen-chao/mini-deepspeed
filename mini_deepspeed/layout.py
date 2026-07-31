@@ -48,15 +48,28 @@ class FlatParameterLayout:
 
     @staticmethod
     def _validate_parameter_storage(parameters: tuple[nn.Parameter, ...]) -> None:
-        """Reject aliases that flat ZeRO ownership cannot preserve safely."""
+        """Reject parameters whose flat ownership would be silently wrong.
+
+        Every element of the flat vector is owned and updated independently,
+        and the updated values are written back with ``copy_``. Two distinct
+        ``Parameter`` objects sharing storage (views, or sliced assignments)
+        break that model: the shared region would receive only the last
+        write-back, silently dropping the other parameter's gradient
+        contribution, while ``torch.optim.AdamW`` compounds both in-place
+        updates. Stage 3 additionally replaces parameter storage during
+        ``materialize``/``release``, which would break aliases outright.
+        Non-contiguous parameters that own their whole storage (for example
+        ``nn.Parameter(tensor.t())``) stay supported: the flat vector stores
+        their logical row-major values.
+        """
         seen_ids: set[int] = set()
         spans: list[tuple[int, int]] = []
         for parameter in parameters:
             if id(parameter) in seen_ids:
                 raise ValueError("ZeRO parameter iterable must not contain the same Parameter twice")
             seen_ids.add(id(parameter))
-            if parameter.layout != torch.strided or not parameter.is_contiguous():
-                raise ValueError("ZeRO supports only contiguous strided Parameters")
+            if parameter.layout != torch.strided:
+                raise ValueError("ZeRO supports only strided Parameters")
             if parameter.numel() == 0:
                 raise ValueError("ZeRO does not support empty Parameters")
             storage = parameter.untyped_storage()

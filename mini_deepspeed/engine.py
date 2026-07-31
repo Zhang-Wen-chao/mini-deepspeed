@@ -19,8 +19,13 @@ class DeepSpeedEngine(nn.Module):
         self.module = module
         self.optimizer = ZeroOptimizer(module.parameters(), config)
         if config.stage == 3:
-            self.module.register_state_dict_pre_hook(self._reject_stage3_module_state_dict)
-            self.module.register_load_state_dict_pre_hook(self._reject_stage3_module_load_state_dict)
+            # `module.state_dict()` fires pre-hooks only on the module it is
+            # called on, so register on every submodule: a direct call on a
+            # child (for example `engine.module[0].state_dict()`) must also
+            # fail loudly instead of serializing empty placeholders.
+            for submodule in self.module.modules():
+                submodule.register_state_dict_pre_hook(self._reject_stage3_module_state_dict)
+                submodule.register_load_state_dict_pre_hook(self._reject_stage3_module_load_state_dict)
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         self.optimizer.prepare_forward()

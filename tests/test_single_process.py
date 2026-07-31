@@ -100,6 +100,12 @@ def test_stage_three_rejects_checkpoints_while_parameters_are_sharded() -> None:
         engine.module.state_dict()
     with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
         engine.module.load_state_dict({})
+    # Pre-hooks are registered on every submodule, so reaching into a child
+    # module directly must not bypass the rejection either.
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.module[0].state_dict()
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.module[1].load_state_dict({})
 
 
 def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
@@ -109,8 +115,42 @@ def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
             self.weight = nn.Parameter(torch.randn(4))
             self.view = nn.Parameter(self.weight[:2])
 
-    with pytest.raises(ValueError, match="Parameter views or shared storage"):
-        mds.initialize(ParameterView(), {"zero_stage": 3})
+    # Shared storage is rejected for every stage: the flat layout updates the
+    # two copies independently and the final write-back would silently drop
+    # one gradient contribution, unlike torch.optim.AdamW's compound in-place
+    # updates.
+    for stage in (0, 1, 2, 3):
+        with pytest.raises(ValueError, match="Parameter views or shared storage"):
+            mds.initialize(ParameterView(), {"zero_stage": stage})
+
+
+def test_noncontiguous_parameters_are_accepted_and_match_adamw() -> None:
+    class NonContiguous(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            # Full-storage transposed parameter: non-contiguous but not a view.
+            self.weight = nn.Parameter(torch.randn(3, 4).t())
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return inputs @ self.weight
+
+    torch.manual_seed(3)
+    inputs, targets = torch.randn(5, 4), torch.randn(5, 3)
+    torch.manual_seed(3)
+    reference = NonContiguous()
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=2e-3, weight_decay=0.1)
+    F.mse_loss(reference(inputs), targets).backward()
+    reference_optimizer.step()
+    expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
+
+    for stage in (0, 1, 2, 3):
+        torch.manual_seed(3)
+        model = NonContiguous()
+        engine = mds.initialize(model, {"zero_stage": stage, "lr": 2e-3, "weight_decay": 0.1})
+        engine.zero_grad()
+        engine.backward(F.mse_loss(engine(inputs), targets))
+        engine.step()
+        torch.testing.assert_close(engine.parameter_vector(), expected, rtol=1e-6, atol=1e-7)
 
 
 def test_ordinary_weight_tying_remains_supported() -> None:
