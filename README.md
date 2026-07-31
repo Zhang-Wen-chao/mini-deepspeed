@@ -98,9 +98,11 @@ kept as an alias) is accepted in Stages 0-2, where the frozen alias follows
 the in-place updates exactly like `torch.optim.AdamW`; Stage 3 rejects it at
 initialization, because replacing parameter storage would silently leave the
 frozen tensor reading stale weights. The supported entry point is
-`initialize(module, ...)`, which declares the module's buffers for this
-check; constructing `ZeroOptimizer` directly for Stage 3 requires an explicit
-`buffers=model.buffers()` argument.
+`initialize(module, ...)`. Direct Stage-3 construction is also supported only
+as `ZeroOptimizer(model, config)`, with the owning `nn.Module` rather than a
+parameter iterable: it must enumerate all registered Parameters (including
+frozen ones) and buffers to reject hidden aliases safely. Stages 0-2 continue
+to accept a parameter iterable.
 
 ## Run locally
 

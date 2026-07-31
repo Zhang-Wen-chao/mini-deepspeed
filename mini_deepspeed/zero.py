@@ -64,36 +64,40 @@ class ZeroOptimizer:
     Stage 3 also shards parameters at rest, eagerly all-gathering the complete
     model for an engine forward/backward pair before releasing it again.
 
-    ``buffers`` is the module's registered-buffer alias scope. Stage 3 requires
-    it explicitly: without it, a trainable parameter aliasing a frozen buffer
-    would silently break when parameter storage is replaced. The supported
-    entry point is ``mini_deepspeed.initialize(module, ...)``, which passes
-    ``module.buffers()`` automatically.
+    Stages 0-2 accept an iterable of trainable parameters. Stage 3 instead
+    requires the owning ``nn.Module`` so it can inspect the complete registered
+    Parameter and buffer universe before it takes ownership of parameter
+    storage. Accepting caller-supplied parameter and buffer iterables there
+    would let an incomplete iterable hide a storage alias that ``materialize``
+    and ``release`` would silently break.
     """
-
-    _UNSET = object()
 
     def __init__(
         self,
-        parameters: Iterable[nn.Parameter],
+        parameters: Iterable[nn.Parameter] | nn.Module,
         config: ZeroConfig,
-        buffers: Iterable[torch.Tensor] | object = _UNSET,
     ):
         self.config = config
         self._distributed = dist.is_available() and dist.is_initialized()
         self.rank = dist.get_rank() if self._distributed else 0
         self.world_size = dist.get_world_size() if self._distributed else 1
-        if buffers is self._UNSET:
-            if config.stage == 3:
+        if config.stage == 3:
+            if not isinstance(parameters, nn.Module):
                 raise TypeError(
-                    "ZeRO-3 ZeroOptimizer requires an explicit buffers= iterable "
-                    "(pass model.buffers()); without it, a trainable parameter aliasing a "
-                    "frozen buffer would silently break when parameter storage is replaced. "
-                    "Use mini_deepspeed.initialize(module, ...) for the supported entry point."
+                    "ZeRO-3 ZeroOptimizer requires an nn.Module, not a parameter iterable; "
+                    "the module provides the complete Parameter and buffer alias scope. "
+                    "Use mini_deepspeed.initialize(module, ...) or pass the module directly."
                 )
+            layout_parameters = parameters.parameters()
+            buffers = parameters.buffers()
+        else:
+            if isinstance(parameters, nn.Module):
+                layout_parameters = parameters.parameters()
+            else:
+                layout_parameters = parameters
             buffers = ()
         self.layout = FlatParameterLayout(
-            parameters,
+            layout_parameters,
             self.world_size,
             buffers=buffers,
             reject_frozen_aliases=(config.stage == 3),

@@ -17,7 +17,7 @@ class DeepSpeedEngine(nn.Module):
     def __init__(self, module: nn.Module, config: ZeroConfig):
         super().__init__()
         self.module = module
-        self.optimizer = ZeroOptimizer(module.parameters(), config, buffers=module.buffers())
+        self.optimizer = ZeroOptimizer(module if config.stage == 3 else module.parameters(), config)
         if config.stage == 3:
             # `module.state_dict()` fires pre-hooks only on the module it is
             # called on, so register on every submodule: a direct call on a

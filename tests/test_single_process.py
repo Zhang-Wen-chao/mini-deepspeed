@@ -156,7 +156,7 @@ def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
             mds.initialize(ParameterView(), {"zero_stage": stage})
 
 
-def test_zero_optimizer_stage_three_requires_explicit_buffers() -> None:
+def test_zero_optimizer_stage_three_requires_owning_module() -> None:
     class BufferAlias(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -164,19 +164,35 @@ def test_zero_optimizer_stage_three_requires_explicit_buffers() -> None:
             self.register_buffer("frozen", self.weight.detach())
 
     model = BufferAlias()
-    parameters = list(model.parameters())
-    # Direct construction without buffers would silently break the alias in
-    # Stage 3; it must fail loudly instead.
-    with pytest.raises(TypeError, match="explicit buffers="):
-        mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=3))
-    # Declaring the real buffers lets the alias check reject the model.
+    # An iterable cannot prove it includes frozen Parameters and registered
+    # buffers, so Stage 3 must own the module instead.
+    with pytest.raises(TypeError, match="requires an nn.Module"):
+        mds.ZeroOptimizer(model.parameters(), mds.ZeroConfig(stage=3))
+    # Owning the module gives the alias check the complete registered scope.
     with pytest.raises(ValueError, match="frozen Parameter or buffer"):
-        mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=3), buffers=model.buffers())
-    # A model without buffers can declare that explicitly.
+        mds.ZeroOptimizer(model, mds.ZeroConfig(stage=3))
+    # A model without buffers is accepted without a caller assertion.
     plain = nn.Linear(4, 2)
-    mds.ZeroOptimizer(plain.parameters(), mds.ZeroConfig(stage=3), buffers=plain.buffers())
+    mds.ZeroOptimizer(plain, mds.ZeroConfig(stage=3))
     # Stages 0-2 never replace parameter storage, so buffers stay optional.
-    mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=2))
+    mds.ZeroOptimizer(model.parameters(), mds.ZeroConfig(stage=2))
+
+
+def test_zero_optimizer_stage_three_cannot_hide_frozen_parameter_alias() -> None:
+    class FrozenAlias(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4))
+            self.frozen = nn.Parameter(self.weight.detach(), requires_grad=False)
+
+    model = FrozenAlias()
+    # Filtering to trainable parameters was the previous bypass: it omitted the
+    # frozen alias from FlatParameterLayout's validation scope.
+    trainable = (parameter for parameter in model.parameters() if parameter.requires_grad)
+    with pytest.raises(TypeError, match="requires an nn.Module"):
+        mds.ZeroOptimizer(trainable, mds.ZeroConfig(stage=3))
+    with pytest.raises(ValueError, match="frozen Parameter or buffer"):
+        mds.ZeroOptimizer(model, mds.ZeroConfig(stage=3))
 
 
 def test_stage_three_rejects_frozen_parameter_and_buffer_aliases() -> None:
