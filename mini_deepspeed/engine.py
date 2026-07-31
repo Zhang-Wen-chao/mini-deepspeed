@@ -23,7 +23,7 @@ class DeepSpeedEngine(nn.Module):
         return self.module(*args, **kwargs)
 
     def backward(self, loss: Tensor) -> None:
-        loss.backward()
+        self.optimizer.backward(loss)
 
     def step(self) -> None:
         self.optimizer.step()

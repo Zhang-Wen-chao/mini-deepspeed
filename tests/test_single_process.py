@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import pytest
 from torch import nn
 
 import mini_deepspeed as mds
@@ -42,3 +43,16 @@ def test_stage_reports_show_expected_ownership() -> None:
     assert report0.gradient_elements == total
     assert report0.optimizer_state_elements == 2 * total
     assert report2.model_state_elements == report0.model_state_elements
+
+
+def test_stage_two_requires_engine_backward_and_a_completed_backward() -> None:
+    model = make_model()
+    engine = mds.initialize(model, {"zero_stage": 2, "reduce_bucket_size": 10})
+
+    with pytest.raises(RuntimeError, match="requires at least one engine.backward"):
+        engine.step()
+
+    inputs = torch.randn(5, 3)
+    targets = torch.randn(5, 2)
+    with pytest.raises(RuntimeError, match=r"engine.backward\(loss\)"):
+        F.mse_loss(engine(inputs), targets).backward()

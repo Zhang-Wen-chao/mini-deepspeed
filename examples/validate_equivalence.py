@@ -23,12 +23,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument(
+        "--reduce-bucket-size",
+        type=int,
+        default=1_048_576,
+        help="ZeRO-2 bucket target in parameter elements",
+    )
     return parser.parse_args()
 
 
-def run_stage(stage: int, device: torch.device, rank: int, steps: int) -> tuple[torch.Tensor, object]:
+def run_stage(
+    stage: int, device: torch.device, rank: int, steps: int, reduce_bucket_size: int
+) -> tuple[torch.Tensor, object]:
     torch.manual_seed(314)
-    engine = mds.initialize(ToyRegressor().to(device), {"zero_stage": stage, "lr": 1e-3})
+    engine = mds.initialize(
+        ToyRegressor().to(device),
+        {"zero_stage": stage, "lr": 1e-3, "reduce_bucket_size": reduce_bucket_size},
+    )
     for step in range(steps):
         generator = torch.Generator(device=device).manual_seed(9000 + step * 97 + rank)
         inputs = torch.randn(16, 32, generator=generator, device=device)
@@ -61,16 +72,17 @@ def main() -> None:
     dist.init_process_group(backend=backend)
     rank = dist.get_rank()
 
-    baseline, baseline_report = run_stage(0, device, rank, args.steps)
+    baseline, baseline_report = run_stage(0, device, rank, args.steps, args.reduce_bucket_size)
     assert_replicas(baseline)
     for stage in (1, 2):
-        actual, report = run_stage(stage, device, rank, args.steps)
+        actual, report = run_stage(stage, device, rank, args.steps, args.reduce_bucket_size)
         assert_replicas(actual)
         torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
         if rank == 0:
             print(
                 f"ZeRO-{stage} == ZeRO-0 after {args.steps} steps; "
                 f"state={report.model_state_elements} vs {baseline_report.model_state_elements}; "
+                f"world_size={dist.get_world_size()}; buckets={report.gradient_bucket_count}; "
                 f"sync={report.synchronization}"
             )
     if rank == 0:

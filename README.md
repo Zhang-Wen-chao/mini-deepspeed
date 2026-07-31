@@ -19,9 +19,9 @@ The first version implements a compact AdamW training engine for ZeRO Stages
 
 For `P` parameters and `N` data-parallel ranks, this gives the persistent
 state model below (ignoring activations, temporary buffers, and communication
-padding). The runtime report uses the equal-sized shard length, so a model
-whose parameter count is not divisible by `N` includes at most one shard's
-padding in its partitioned counters:
+padding). Stage 2 reports the sum of equal shard lengths for its gradient
+buckets, so every bucket can contribute final-shard padding when its size is
+not divisible by `N`:
 
 | Mode | Elements retained per rank |
 | --- | --- |
@@ -37,7 +37,9 @@ important memory-accounting boundary of this educational implementation.
 ```python
 import mini_deepspeed as mds
 
-engine = mds.initialize(model, {"zero_stage": 2, "lr": 1e-3})
+engine = mds.initialize(
+    model, {"zero_stage": 2, "lr": 1e-3, "reduce_bucket_size": 1_048_576}
+)
 loss = loss_fn(engine(inputs), targets)
 engine.backward(loss)
 engine.step()
@@ -46,11 +48,12 @@ engine.zero_grad()
 print(engine.report())
 ```
 
-`initialize` accepts `zero_stage` 0, 1, or 2, plus `lr`, `betas`, `eps`, and
-`weight_decay`. The engine intentionally exposes only the lifecycle needed to
-make the ownership and collectives easy to inspect. In a distributed launch it
-also broadcasts rank 0's initial parameters once, matching DDP's replica
-initialization invariant.
+`initialize` accepts `zero_stage` 0, 1, or 2, plus `lr`, `betas`, `eps`,
+`weight_decay`, and the Stage-2 `reduce_bucket_size`. Calling `backward`
+multiple times before `step` accumulates the unscaled gradient sum. The engine
+intentionally exposes only the lifecycle needed to make ownership and
+collectives easy to inspect. In a distributed launch it also broadcasts rank
+0's initial parameters once, matching DDP's replica-initialization invariant.
 
 ## Run locally
 
@@ -72,7 +75,7 @@ On a Gloo build that does not provide `reduce_scatter`, ZeRO-2 takes a clearly
 labelled all-reduce-and-slice correctness fallback. NCCL uses PyTorch's native
 `reduce_scatter_tensor` path.
 
-## L20 two-GPU run
+## L20 multi-GPU run
 
 The `experiment` experiment container requires an explicit loopback
 rendezvous rather than `torchrun --standalone`. Its current reliable settings
@@ -86,12 +89,17 @@ torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=296
   examples/train_toy.py --zero-stage 2 --device cuda --steps 8
 
 torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29700 \
-  examples/validate_equivalence.py --device cuda --steps 4
+  examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
+
+# Four L20s: exercise non-divisible shards and multiple Stage-2 buckets.
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29741 \
+  examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
 ```
 
-An L20/NCCL two-rank run completed eight toy-training steps at every stage
-with the same reported losses at steps 1 and 8. For the 21,768-parameter toy
-model, the reported per-rank retained model-state elements were:
+An L20/NCCL four-rank run completed the equivalence check with native
+`reduce_scatter_tensor`: ZeRO-1 and ZeRO-2 both matched ZeRO-0 after four
+steps. For the 21,768-parameter toy model, the reported per-rank retained
+model-state elements were:
 
 | Stage | Parameters | Gradients | Adam states | Total |
 | --- | ---: | ---: | ---: | ---: |
@@ -102,24 +110,36 @@ model, the reported per-rank retained model-state elements were:
 ## Verification included
 
 `tests/test_single_process.py` compares every stage with `torch.optim.AdamW`
-in one process. `tests/test_distributed.py` launches two Gloo ranks with
-different data on each rank, verifies that each stage keeps replicas equal,
-and verifies ZeRO-1/2 against the Stage-0 baseline. The standalone
-`examples/validate_equivalence.py` repeats the same comparison for a real
-NCCL two-GPU launch.
+in one process. `tests/test_distributed.py` covers world sizes 1, 2, and 4
+with a 65-parameter model (deliberately not divisible by 2 or 4), two
+different microbatches per update, and four Stage-2 buckets. It verifies that
+the hook clears complete `param.grad` tensors after each backward call, keeps
+replicas equal, and matches ZeRO-1/2 against the Stage-0 baseline.
+`examples/validate_equivalence.py` repeats the comparison under a real NCCL
+launch.
+
+`examples/compare_deepspeed.py` is the external reference check. It runs the
+same model, per-rank deterministic inputs, AdamW configuration, and gradient
+accumulation semantics against DeepSpeed ZeRO-0/1/2, then compares final
+parameters element by element. The L20 result passed for DeepSpeed 0.19.3 and
+PyTorch 2.10.0a0 on both 2 and 4 GPUs; the four-GPU maximum absolute error was
+at most `7.451e-09`. DeepSpeed is installed only in an isolated validation
+environment and is not a runtime dependency of this project.
 
 ## Scope and next work
 
 This is a teaching engine, not a drop-in DeepSpeed replacement. It excludes
-configuration compatibility, tensor parallelism, pipeline parallelism,
-checkpoint sharding, mixed precision, gradient accumulation, CPU/NVMe
-offload, and ZeRO-3 parameter sharding.
+configuration compatibility, tensor/pipeline parallelism, checkpoint sharding,
+mixed precision, gradient clipping, CPU/NVMe offload, and ZeRO-3 parameter
+sharding.
 
-Most importantly, Stage 2 is correct about *logical state ownership*, but
-autograd still materializes a full `param.grad` before the implementation
-flattens it. Its report therefore accounts for retained state after
-synchronization, not CUDA's transient backward peak. A real physical
-peak-memory Stage-2 implementation needs bucketed gradient hooks that
-reduce-scatter and release each bucket as soon as it is ready. ZeRO-3 would
-then shard parameters too, all-gathering a layer only for its forward/backward
-use. Those are the intended next milestones.
+Stage 2 registers post-accumulate-gradient hooks. When every parameter in a
+complete parameter bucket is ready, the hook flattens and pads its gradients,
+uses native NCCL reduce-scatter (or the labelled Gloo correctness fallback),
+retains only the local averaged shard, and clears the full `param.grad`
+tensors. This proves the intended lifecycle, but is not a CUDA allocator
+peak-memory measurement: autograd still creates individual gradients, the
+implementation uses temporary flattened buffers and no communication overlap,
+and a single parameter is never split across buckets. Allocator telemetry is
+required before claiming a physical peak-memory reduction. ZeRO-3 would then
+shard parameters too, all-gathering a layer only for its forward/backward use.

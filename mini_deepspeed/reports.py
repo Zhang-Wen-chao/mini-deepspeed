@@ -15,6 +15,7 @@ class ZeroReport:
     optimizer_state_elements: int
     synchronization: str
     logical_collective_elements: int
+    gradient_bucket_count: int
 
     @property
     def model_state_elements(self) -> int:
