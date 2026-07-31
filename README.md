@@ -130,11 +130,14 @@ explicitly rejected.
 
 The `experiment` experiment container requires an explicit loopback
 rendezvous rather than `torchrun --standalone`. Its current reliable settings
-are `NCCL_SHM_DISABLE=1` and `CUDA_DEVICE_MAX_CONNECTIONS=1`.
+are `NCCL_SHM_DISABLE=1`, `CUDA_DEVICE_MAX_CONNECTIONS=1`, and loopback
+network-interface selection for Gloo and NCCL.
 
 ```bash
 export NCCL_SHM_DISABLE=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export GLOO_SOCKET_IFNAME=lo
+export NCCL_SOCKET_IFNAME=lo
 
 torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29662 \
   examples/train_toy.py --zero-stage 2 --device cuda --steps 8
@@ -169,27 +172,34 @@ the hook clears complete `param.grad` tensors after each backward call, keeps
 replicas equal, checks that ZeRO-3 releases complete parameters after each
 backward, and matches ZeRO-1/2/3 against the Stage-0 baseline.
 `examples/validate_equivalence.py` repeats the comparison under a real NCCL
-launch and compares the parameter vector after *every* step. Its Stage-3
-default is a pure absolute threshold (`rtol=0`, `atol=3e-7`), rather than a
-broad relative tolerance; the four-L20, four-step run observed a maximum
-absolute difference of `2.431e-07` from the different FP32 reduction trees.
-That default is calibrated to the documented L20 configuration (`lr=1e-3`,
-four steps); other learning rates, step counts, or GPUs change how the
-reduction-tree noise propagates through AdamW, so re-calibrate
-`--stage3-atol` on the printed `max_abs_error_over_steps` before relying on
-it.
+launch and compares the parameter vector after *every* step. Its ZeRO-2/3
+reduce-scatter default is a pure absolute threshold (`rtol=0`, `atol=3e-7`),
+rather than a broad relative tolerance: both stages use reduce-scatter while
+the Stage-0 baseline uses all-reduce. The current four-L20, four-step run
+observed maximum absolute differences of `1.006e-07` (ZeRO-2) and
+`2.431e-07` (ZeRO-3), from the different FP32 reduction trees. That default
+is calibrated only to the
+documented L20 configuration (`lr=1e-3`, four steps). On the same setup at
+20 steps, the observed maxima rose to `6.557e-07` (ZeRO-2) and `1.032e-06`
+(ZeRO-3). Other learning rates, step counts, GPUs, or NCCL versions likewise
+change how rounding noise propagates through AdamW, so re-calibrate
+`--reduce-scatter-atol` on the printed `max_abs_error_over_steps` before
+relying on it. `--stage3-atol` remains a compatibility alias.
 
 `examples/compare_deepspeed.py` is the external reference check. It runs the
 same model, per-rank deterministic inputs, AdamW configuration (including
 non-zero weight decay), and gradient-accumulation semantics against DeepSpeed
 ZeRO-0/1/2/3. It asserts equal replicated initial parameters before training and
-then compares final parameters element by element. The DeepSpeed loop follows
-its public GAS protocol: it calls `engine.step()` after every microbatch and
-asserts the documented accumulation boundary and `global_steps` behavior. The
-L20 result passed for DeepSpeed 0.19.3 and PyTorch 2.10.0a0 on both 2 and 4
-GPUs; the four-GPU maximum absolute error was at most `1.490e-08`. DeepSpeed
-is installed only in an isolated validation environment and is not a runtime
-dependency of this project.
+compares every post-update parameter vector element by element. The DeepSpeed
+loop follows its public GAS protocol: it calls `engine.step()` after every
+microbatch and asserts the documented accumulation boundary and `global_steps`
+behavior. The L20 result passed for DeepSpeed 0.19.3 and PyTorch 2.10.0a0 on
+both 2 and 4 GPUs; the four-GPU maximum absolute error was at most `1.490e-08`
+for ZeRO-0/1/2 and `7.451e-09` for ZeRO-3. The validation script disables
+DeepSpeed NVTX annotations only, to avoid an NVTX-domain API incompatibility in
+the current container; this does not change model, collective, or optimizer
+behavior. DeepSpeed is installed only in an isolated validation environment and
+is not a runtime dependency of this project.
 
 ## Scope and next work
 

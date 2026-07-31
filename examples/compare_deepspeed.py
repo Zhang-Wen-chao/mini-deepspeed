@@ -55,6 +55,13 @@ def _require_deepspeed() -> Any:
             "DeepSpeed is intentionally not a mini-deepspeed dependency. Install it in an isolated "
             "environment, then launch this program with that environment's torchrun."
         ) from error
+    # This numerical reference does not collect profiling data. Disabling
+    # annotations also avoids a DeepSpeed 0.19.3/NVTX-domain API mismatch on
+    # newer CUDA Python environments; it does not change model execution,
+    # collectives, or optimizer semantics.
+    import deepspeed.utils.nvtx as nvtx
+
+    nvtx.enable_nvtx = False
     return deepspeed
 
 
@@ -87,7 +94,7 @@ def _assert_replicated(flat: torch.Tensor, rtol: float, atol: float) -> None:
 
 def _run_mini(
     stage: int, args: argparse.Namespace, rank: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     torch.manual_seed(314)
     engine = mds.initialize(
         ReferenceRegressor().to(device),
@@ -100,15 +107,17 @@ def _run_mini(
     )
     initial = engine.parameter_vector()
     _assert_replicated(initial, args.rtol, args.atol)
+    history: list[torch.Tensor] = []
     for step in range(args.steps):
         engine.zero_grad()
         for microbatch in range(args.microbatches):
             inputs, targets = _batch(step, microbatch, rank, device)
             engine.backward(F.mse_loss(engine(inputs), targets))
         engine.step()
-    flat = engine.parameter_vector()
-    _assert_replicated(flat, args.rtol, args.atol)
-    return initial, flat
+        snapshot = engine.parameter_vector()
+        _assert_replicated(snapshot, args.rtol, args.atol)
+        history.append(snapshot)
+    return initial, history
 
 
 def _deepspeed_config(stage: int, args: argparse.Namespace) -> dict[str, Any]:
@@ -147,7 +156,7 @@ def _deepspeed_config(stage: int, args: argparse.Namespace) -> dict[str, Any]:
 
 def _run_deepspeed(
     deepspeed: Any, stage: int, args: argparse.Namespace, rank: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     torch.manual_seed(314)
     module = ReferenceRegressor().to(device)
     engine, _, _, _ = deepspeed.initialize(
@@ -158,6 +167,7 @@ def _run_deepspeed(
     )
     initial = _flatten_deepspeed(deepspeed, engine.module, stage)
     _assert_replicated(initial, args.rtol, args.atol)
+    history: list[torch.Tensor] = []
     for step in range(args.steps):
         engine.zero_grad()
         for microbatch in range(args.microbatches):
@@ -176,9 +186,11 @@ def _run_deepspeed(
             expected_global_steps = previous_global_steps + int(expected_boundary)
             if engine.global_steps != expected_global_steps:
                 raise RuntimeError("DeepSpeed step did not follow its documented accumulation boundary")
-    flat = _flatten_deepspeed(deepspeed, engine.module, stage)
-    _assert_replicated(flat, args.rtol, args.atol)
-    return initial, flat
+            if expected_boundary:
+                snapshot = _flatten_deepspeed(deepspeed, engine.module, stage)
+                _assert_replicated(snapshot, args.rtol, args.atol)
+                history.append(snapshot)
+    return initial, history
 
 
 def _max_abs_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -201,15 +213,20 @@ def main() -> None:
                 f"world_size={dist.get_world_size()}; dtype=float32"
             )
         for stage in (0, 1, 2, 3):
-            mini_initial, mini_parameters = _run_mini(stage, args, rank, device)
+            mini_initial, mini_history = _run_mini(stage, args, rank, device)
             dist.barrier()
-            deepspeed_initial, deepspeed_parameters = _run_deepspeed(deepspeed, stage, args, rank, device)
+            deepspeed_initial, deepspeed_history = _run_deepspeed(deepspeed, stage, args, rank, device)
             torch.testing.assert_close(deepspeed_initial, mini_initial, rtol=args.rtol, atol=args.atol)
-            torch.testing.assert_close(deepspeed_parameters, mini_parameters, rtol=args.rtol, atol=args.atol)
+            if len(deepspeed_history) != len(mini_history):
+                raise RuntimeError("mini-deepspeed and DeepSpeed produced a different number of updates")
+            max_error = 0.0
+            for deepspeed_parameters, mini_parameters in zip(deepspeed_history, mini_history, strict=True):
+                torch.testing.assert_close(deepspeed_parameters, mini_parameters, rtol=args.rtol, atol=args.atol)
+                max_error = max(max_error, _max_abs_error(deepspeed_parameters, mini_parameters))
             if rank == 0:
                 print(
-                    f"PASS: mini ZeRO-{stage} initial and final parameters == DeepSpeed; "
-                    f"max_abs_error={_max_abs_error(deepspeed_parameters, mini_parameters):.3e}"
+                    f"PASS: mini ZeRO-{stage} initial and {args.steps} post-step parameter snapshots "
+                    f"== DeepSpeed; max_abs_error={max_error:.3e}"
                 )
         if rank == 0:
             print("PASS: all DeepSpeed ZeRO-0/1/2/3 reference comparisons matched")

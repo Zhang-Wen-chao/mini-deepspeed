@@ -30,16 +30,23 @@ def parse_args() -> argparse.Namespace:
         help="ZeRO-2 bucket target in parameter elements",
     )
     parser.add_argument(
+        "--reduce-scatter-rtol",
         "--stage3-rtol",
+        dest="reduce_scatter_rtol",
         type=float,
         default=0.0,
-        help="Stage-3 NCCL comparison relative tolerance; default keeps the observed FP32 tree difference absolute",
+        help=(
+            "ZeRO-2/3 NCCL reduce-scatter comparison relative tolerance; the default keeps "
+            "the four-step L20 calibration purely absolute"
+        ),
     )
     parser.add_argument(
+        "--reduce-scatter-atol",
         "--stage3-atol",
+        dest="reduce_scatter_atol",
         type=float,
         default=3e-7,
-        help="Stage-3 NCCL comparison absolute tolerance",
+        help="ZeRO-2/3 NCCL reduce-scatter comparison absolute tolerance",
     )
     return parser.parse_args()
 
@@ -97,8 +104,16 @@ def main() -> None:
         max_error = 0.0
         for actual, baseline in zip(actual_history, baseline_history, strict=True):
             max_error = max(max_error, max_abs_error(actual, baseline))
-            if stage == 3:
-                torch.testing.assert_close(actual, baseline, rtol=args.stage3_rtol, atol=args.stage3_atol)
+            # Stages 2 and 3 both use reduce-scatter while the Stage-0
+            # baseline uses all-reduce. NCCL may therefore choose a different
+            # FP32 reduction tree for either stage.
+            if stage >= 2:
+                torch.testing.assert_close(
+                    actual,
+                    baseline,
+                    rtol=args.reduce_scatter_rtol,
+                    atol=args.reduce_scatter_atol,
+                )
             else:
                 torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
         if rank == 0:
