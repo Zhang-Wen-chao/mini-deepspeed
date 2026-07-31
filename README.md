@@ -79,7 +79,10 @@ Stage 3 intentionally has no checkpoint format yet. `engine.state_dict()`,
 module or any of its submodules raise rather than silently serializing the
 empty parameter placeholders held between iterations. `torch.save(module)`
 (pickle) and `copy.deepcopy(module)` bypass that guard and would serialize
-empty tensors, so they must not be used between iterations. Ordinary tied
+empty tensors, so they must not be used between iterations. Pickling the
+engine itself is likewise unsupported: it may appear to restore a
+single-process run, but there is no multi-rank, cross-world-size,
+cross-version, or mid-window guarantee. Ordinary tied
 weights (two module attributes referring to the *same* `Parameter`) are
 supported because PyTorch deduplicates `module.parameters()`. Independently
 constructed `Parameter` views or distinct parameters sharing storage are
@@ -94,7 +97,10 @@ with a *frozen* `Parameter` or a registered buffer (for example a frozen copy
 kept as an alias) is accepted in Stages 0-2, where the frozen alias follows
 the in-place updates exactly like `torch.optim.AdamW`; Stage 3 rejects it at
 initialization, because replacing parameter storage would silently leave the
-frozen tensor reading stale weights.
+frozen tensor reading stale weights. The supported entry point is
+`initialize(module, ...)`, which declares the module's buffers for this
+check; constructing `ZeroOptimizer` directly for Stage 3 requires an explicit
+`buffers=model.buffers()` argument.
 
 ## Run locally
 

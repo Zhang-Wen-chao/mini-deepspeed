@@ -156,6 +156,29 @@ def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
             mds.initialize(ParameterView(), {"zero_stage": stage})
 
 
+def test_zero_optimizer_stage_three_requires_explicit_buffers() -> None:
+    class BufferAlias(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4))
+            self.register_buffer("frozen", self.weight.detach())
+
+    model = BufferAlias()
+    parameters = list(model.parameters())
+    # Direct construction without buffers would silently break the alias in
+    # Stage 3; it must fail loudly instead.
+    with pytest.raises(TypeError, match="explicit buffers="):
+        mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=3))
+    # Declaring the real buffers lets the alias check reject the model.
+    with pytest.raises(ValueError, match="frozen Parameter or buffer"):
+        mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=3), buffers=model.buffers())
+    # A model without buffers can declare that explicitly.
+    plain = nn.Linear(4, 2)
+    mds.ZeroOptimizer(plain.parameters(), mds.ZeroConfig(stage=3), buffers=plain.buffers())
+    # Stages 0-2 never replace parameter storage, so buffers stay optional.
+    mds.ZeroOptimizer(parameters, mds.ZeroConfig(stage=2))
+
+
 def test_stage_three_rejects_frozen_parameter_and_buffer_aliases() -> None:
     class FrozenAlias(nn.Module):
         def __init__(self, as_buffer: bool, slice_alias: bool) -> None:
@@ -172,17 +195,18 @@ def test_stage_three_rejects_frozen_parameter_and_buffer_aliases() -> None:
 
     for as_buffer in (False, True):
         for slice_alias in (False, True):
-            model = FrozenAlias(as_buffer, slice_alias)
             # Stages 0-2 keep full storage and write updates back with copy_,
             # so the frozen alias follows the trainable parameter exactly like
-            # torch.optim.AdamW. Only Stage 3 breaks the alias by replacing
-            # parameter storage.
+            # torch.optim.AdamW, even as AdamW state evolves. Only Stage 3
+            # breaks the alias by replacing parameter storage.
             torch.manual_seed(31)
             reference = FrozenAlias(as_buffer, slice_alias)
-            inputs, targets = torch.randn(5, 4), torch.randn(())
             reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=2e-3, weight_decay=0.1)
-            F.mse_loss(reference(inputs), targets).backward()
-            reference_optimizer.step()
+            for step in range(2):
+                inputs, targets = torch.randn(5, 4), torch.randn(())
+                reference_optimizer.zero_grad()
+                F.mse_loss(reference(inputs), targets).backward()
+                reference_optimizer.step()
             expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
             for stage in (0, 1, 2):
                 torch.manual_seed(31)
@@ -190,9 +214,11 @@ def test_stage_three_rejects_frozen_parameter_and_buffer_aliases() -> None:
                 engine = mds.initialize(
                     engine_model, {"zero_stage": stage, "lr": 2e-3, "weight_decay": 0.1}
                 )
-                engine.zero_grad()
-                engine.backward(F.mse_loss(engine(inputs), targets))
-                engine.step()
+                for step in range(2):
+                    inputs, targets = torch.randn(5, 4), torch.randn(())
+                    engine.zero_grad()
+                    engine.backward(F.mse_loss(engine(inputs), targets))
+                    engine.step()
                 actual = torch.cat([parameter.detach().reshape(-1) for parameter in engine_model.parameters()])
                 torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
             with pytest.raises(ValueError, match="frozen Parameter or buffer"):

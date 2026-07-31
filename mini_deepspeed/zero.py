@@ -63,18 +63,35 @@ class ZeroOptimizer:
     it reduce-scatters that bucket and immediately releases the full grads.
     Stage 3 also shards parameters at rest, eagerly all-gathering the complete
     model for an engine forward/backward pair before releasing it again.
+
+    ``buffers`` is the module's registered-buffer alias scope. Stage 3 requires
+    it explicitly: without it, a trainable parameter aliasing a frozen buffer
+    would silently break when parameter storage is replaced. The supported
+    entry point is ``mini_deepspeed.initialize(module, ...)``, which passes
+    ``module.buffers()`` automatically.
     """
+
+    _UNSET = object()
 
     def __init__(
         self,
         parameters: Iterable[nn.Parameter],
         config: ZeroConfig,
-        buffers: Iterable[torch.Tensor] = (),
+        buffers: Iterable[torch.Tensor] | object = _UNSET,
     ):
         self.config = config
         self._distributed = dist.is_available() and dist.is_initialized()
         self.rank = dist.get_rank() if self._distributed else 0
         self.world_size = dist.get_world_size() if self._distributed else 1
+        if buffers is self._UNSET:
+            if config.stage == 3:
+                raise TypeError(
+                    "ZeRO-3 ZeroOptimizer requires an explicit buffers= iterable "
+                    "(pass model.buffers()); without it, a trainable parameter aliasing a "
+                    "frozen buffer would silently break when parameter storage is replaced. "
+                    "Use mini_deepspeed.initialize(module, ...) for the supported entry point."
+                )
+            buffers = ()
         self.layout = FlatParameterLayout(
             parameters,
             self.world_size,
