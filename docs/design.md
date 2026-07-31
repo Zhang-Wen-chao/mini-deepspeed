@@ -1,4 +1,4 @@
-# Design: why the three stages differ
+# Design: why the ZeRO stages differ
 
 For `P` parameter elements trained by `N` data-parallel ranks, Adam retains
 two optimizer tensors (`m` and `v`) per parameter. Ignoring activations and
@@ -46,6 +46,24 @@ and does not release one layer before the next layer runs. Its API intentionally
 requires exactly one engine forward before each engine backward. A diagnostic
 `parameter_vector()` call gathers only a detached inspection copy; it does not
 change persistent ownership.
+
+During a normal engine-mediated forward, a module exception is synchronized so
+that every rank releases its materialization and raises. Likewise, after a
+backward each rank synchronizes whether it saw an exception or a missing
+trainable gradient before any reduce-scatter begins. The resulting invalidated
+window is recoverable only when **every** rank calls `zero_grad()` and resumes
+the same schedule. This prevents the common case where one rank raises locally
+while peers block in a later collective; it cannot make arbitrary
+rank-divergent engine calls safe, which is a fundamental constraint of
+synchronous collectives.
+
+There is no Stage-3 checkpoint API. Both engine and direct module state-dict
+save/load calls are explicitly rejected while no sharded format exists, instead
+of serializing empty placeholders between iterations. The flat layout supports
+normal weight tying where PyTorch exposes one `Parameter` object once through
+`module.parameters()`. It rejects distinct `Parameter` objects that are views
+or share storage, because Stage-3 materialization replaces parameter storage
+and cannot preserve those aliases safely.
 
 ## Stage-2 bucket lifecycle
 

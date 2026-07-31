@@ -26,7 +26,9 @@ class FlatParameterLayout:
     """
 
     def __init__(self, parameters: Iterable[nn.Parameter], world_size: int):
-        self.parameters = tuple(parameter for parameter in parameters if parameter.requires_grad)
+        source = tuple(parameter for parameter in parameters if parameter.requires_grad)
+        self._validate_parameter_storage(source)
+        self.parameters = source
         if not self.parameters:
             raise ValueError("ZeRO requires at least one trainable parameter")
         if world_size < 1:
@@ -43,6 +45,28 @@ class FlatParameterLayout:
         self.world_size = world_size
         self.shard_numel = (self.numel + world_size - 1) // world_size
         self.padded_numel = self.shard_numel * world_size
+
+    @staticmethod
+    def _validate_parameter_storage(parameters: tuple[nn.Parameter, ...]) -> None:
+        """Reject aliases that flat ZeRO ownership cannot preserve safely."""
+        seen_ids: set[int] = set()
+        spans: list[tuple[int, int]] = []
+        for parameter in parameters:
+            if id(parameter) in seen_ids:
+                raise ValueError("ZeRO parameter iterable must not contain the same Parameter twice")
+            seen_ids.add(id(parameter))
+            if parameter.layout != torch.strided or not parameter.is_contiguous():
+                raise ValueError("ZeRO supports only contiguous strided Parameters")
+            if parameter.numel() == 0:
+                raise ValueError("ZeRO does not support empty Parameters")
+            storage = parameter.untyped_storage()
+            if parameter.storage_offset() != 0 or storage.nbytes() != parameter.numel() * parameter.element_size():
+                raise ValueError("ZeRO does not support Parameter views or shared storage")
+            start = storage.data_ptr()
+            end = start + storage.nbytes()
+            if any(start < other_end and other_start < end for other_start, other_end in spans):
+                raise ValueError("ZeRO does not support Parameter views or shared storage")
+            spans.append((start, end))
 
     @property
     def device(self) -> torch.device:

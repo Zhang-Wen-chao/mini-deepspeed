@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-deepspeed"
 version = "0.1.0"
-description = "A small pure-PyTorch teaching implementation of ZeRO-0/1/2"
+description = "A small pure-PyTorch teaching implementation of ZeRO-0/1/2/3"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.1,<3"]

@@ -85,7 +85,6 @@ class ZeroOptimizer:
         self._stage3_parameter_shard: torch.Tensor | None = None
         self._stage3_gradient_shard: torch.Tensor | None = None
         self._stage3_parameters_materialized = False
-        self._stage3_backward_active = False
         self._stage3_backward_calls = 0
         self._stage3_invalidated = False
         self._stage3_collective_elements = 0
@@ -162,12 +161,21 @@ class ZeroOptimizer:
             self._stage3_collective_elements += self.layout.padded_numel
 
     def abort_forward(self) -> None:
-        """Release a ZeRO-3 materialization after a failed module forward."""
+        """Coordinately release an abandoned ZeRO-3 materialization."""
         if self.config.stage == 3 and self._stage3_parameters_materialized:
-            self.layout.release()
-            self._stage3_parameters_materialized = False
-            self._reset_stage3_accumulation()
-            self._stage3_invalidated = True
+            self._synchronize_stage3_failure(True)
+            self._invalidate_stage3()
+
+    def finish_forward(self, local_error: BaseException | None) -> None:
+        """Turn a rank-local module error into a coordinated ZeRO-3 failure."""
+        if self.config.stage != 3 or not self._stage3_parameters_materialized:
+            return
+        if not self._synchronize_stage3_failure(local_error is not None):
+            return
+        self._invalidate_stage3()
+        if local_error is not None:
+            raise RuntimeError("ZeRO-3 forward failed; all ranks must reset together") from local_error
+        raise RuntimeError("ZeRO-3 forward failed on another rank; all ranks must reset together")
 
     def parameter_vector(self) -> torch.Tensor:
         """Return a full detached parameter vector without retaining ZeRO-3 params."""
@@ -358,15 +366,31 @@ class ZeroOptimizer:
             raise RuntimeError("ZeRO-3 requires engine.forward(inputs) before engine.backward(loss)")
         if self._stage3_invalidated:
             raise RuntimeError("ZeRO-3 accumulation was invalidated; call zero_grad() before backward")
+        if self._synchronize_stage3_failure(False):
+            self._invalidate_stage3()
+            raise RuntimeError("ZeRO-3 forward failed on at least one rank; all ranks must reset together")
+
+        local_error: BaseException | None = None
+        missing: list[int] = []
         try:
-            self._stage3_backward_active = True
             loss.backward()
+        except BaseException as error:
+            local_error = error
+        else:
             missing = [index for index, parameter in enumerate(self.layout.parameters) if parameter.grad is None]
+
+        if self._synchronize_stage3_failure(local_error is not None or bool(missing)):
+            self._invalidate_stage3()
+            if local_error is not None:
+                raise RuntimeError("ZeRO-3 backward failed; all ranks must reset together") from local_error
             if missing:
                 raise RuntimeError(
                     "ZeRO-3 requires every trainable parameter to participate in each backward; "
-                    f"missing parameters={missing}"
+                    f"missing parameters={missing}; all ranks must reset together"
                 )
+            raise RuntimeError("ZeRO-3 backward failed on another rank; all ranks must reset together")
+
+        try:
             padded_gradients = self.layout.pad(self.layout.flatten_gradients())
             gradient_shard = self._reduce_scatter_mean(padded_gradients, self.layout)
             if self._stage3_gradient_shard is None:
@@ -375,11 +399,9 @@ class ZeroOptimizer:
                 self._stage3_gradient_shard.add_(gradient_shard)
             self._stage3_backward_calls += 1
         except BaseException:
-            self._reset_stage3_accumulation()
-            self._stage3_invalidated = True
+            self._invalidate_stage3()
             raise
         finally:
-            self._stage3_backward_active = False
             self.layout.release()
             self._stage3_parameters_materialized = False
 
@@ -414,6 +436,24 @@ class ZeroOptimizer:
         self._stage3_gradient_shard = None
         self._stage3_backward_calls = 0
         self._stage3_collective_elements = 0
+
+    def _invalidate_stage3(self) -> None:
+        self.layout.release()
+        self._stage3_parameters_materialized = False
+        self._reset_stage3_accumulation()
+        self._stage3_invalidated = True
+
+    def _synchronize_stage3_failure(self, local_failure: bool) -> bool:
+        """Ensure local validation failures become a coordinated rank failure."""
+        if not self._distributed:
+            return local_failure
+        failed = torch.tensor(int(local_failure), device=self.layout.device, dtype=torch.int32)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        return bool(failed.item())
+
+    @property
+    def stage3_parameters_materialized(self) -> bool:
+        return self.config.stage == 3 and self._stage3_parameters_materialized
 
     def report(self) -> ZeroReport:
         full = self.layout.numel

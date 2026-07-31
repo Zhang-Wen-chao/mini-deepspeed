@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,20 @@ class _DivisibleRegressor(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.layers(inputs) + self.offset.repeat(2)
+
+
+class _RankConditionalRegressor(nn.Module):
+    """Lets one rank omit every parameter to test coordinated ZeRO-3 failure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(4, 9), nn.Tanh(), nn.Linear(9, 2))
+        self.mode = "normal"
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if self.mode == "raise":
+            raise ValueError("deliberate rank-local forward failure")
+        return inputs[:, :2] if self.mode == "skip" else self.layers(inputs)
 
 
 def _make_model(numel: int = 65) -> nn.Module:
@@ -103,6 +118,55 @@ def _run_stage(stage: int, world_size: int, root: Path, model_numel: int = 65) -
         join=True,
     )
     return torch.load(result_file, weights_only=False)
+
+
+def _failure_worker(rank: int, world_size: int, init_file: str, result_file: str, mode: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        torch.manual_seed(50 + rank)
+        model = _RankConditionalRegressor()
+        engine = mds.initialize(model, {"zero_stage": 3, "lr": 5e-3})
+        model.mode = mode if rank == 1 else "normal"
+        inputs = torch.randn(6, 4, requires_grad=True)
+        targets = torch.randn(6, 2)
+        with pytest.raises(RuntimeError, match="all ranks must reset together"):
+            if mode == "raise":
+                engine(inputs)
+            else:
+                engine.backward(F.mse_loss(engine(inputs), targets))
+        assert all(parameter.numel() == 0 for parameter in model.parameters())
+
+        # A coordinated zero_grad makes the engine usable again on every rank.
+        engine.zero_grad()
+        model.mode = "normal"
+        engine.backward(F.mse_loss(engine(inputs), targets))
+        engine.step()
+        flat = engine.parameter_vector()
+        replicas = [torch.empty_like(flat) for _ in range(world_size)]
+        dist.all_gather(replicas, flat)
+        for replica in replicas[1:]:
+            torch.testing.assert_close(replica, replicas[0], rtol=1e-6, atol=1e-7)
+        if rank == 0:
+            torch.save({"recovered": True}, result_file)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("mode", ["skip", "raise"])
+def test_stage_three_rank_local_failure_is_coordinated(mode: str) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        init_file = root / f"gloo-init-failure-{mode}"
+        result_file = root / f"failure-result-{mode}.pt"
+        mp.spawn(_failure_worker, args=(2, str(init_file), str(result_file), mode), nprocs=2, join=True)
+        result = torch.load(result_file, weights_only=False)
+    assert result["recovered"]
 
 
 @pytest.mark.parametrize("world_size", [1, 2, 4])

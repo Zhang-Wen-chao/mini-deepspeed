@@ -62,6 +62,23 @@ pair, then releases complete parameter tensors. `engine.parameter_vector()`
 temporarily gathers a detached full vector for testing or inspection. If a
 forward result will not be backpropagated, call `engine.abort_forward()`.
 
+In distributed Stage 3, an ordinary rank-local module-forward failure or a
+backward with missing trainable gradients is detected before the next
+reduce-scatter. Every rank releases its materialization and raises, then every
+rank must call `zero_grad()` before resuming. This does not relax the normal
+distributed contract: all ranks must still follow the same engine API and
+collective schedule; rank-divergent user control flow can still deadlock any
+synchronous collective program.
+
+Stage 3 intentionally has no checkpoint format yet. `engine.state_dict()`,
+`engine.load_state_dict()`, and direct `engine.module.state_dict()` /
+`load_state_dict()` raise rather than silently serializing the empty parameter
+placeholders held between iterations. Ordinary tied weights (two module
+attributes referring to the *same* `Parameter`) are supported because PyTorch
+deduplicates `module.parameters()`. Independently constructed `Parameter`
+views or distinct parameters sharing storage are rejected, since replacing
+Stage-3 parameter storage could otherwise silently break their aliasing.
+
 ## Run locally
 
 Requires Python 3.10+ and PyTorch 2.1+.
@@ -127,7 +144,10 @@ the hook clears complete `param.grad` tensors after each backward call, keeps
 replicas equal, checks that ZeRO-3 releases complete parameters after each
 backward, and matches ZeRO-1/2/3 against the Stage-0 baseline.
 `examples/validate_equivalence.py` repeats the comparison under a real NCCL
-launch.
+launch and compares the parameter vector after *every* step. Its Stage-3
+default is a pure absolute threshold (`rtol=0`, `atol=3e-7`), rather than a
+broad relative tolerance; the four-L20, four-step run observed a maximum
+absolute difference of `2.431e-07` from the different FP32 reduction trees.
 
 `examples/compare_deepspeed.py` is the external reference check. It runs the
 same model, per-rank deterministic inputs, AdamW configuration (including
@@ -147,6 +167,8 @@ This is a teaching engine, not a drop-in DeepSpeed replacement. It excludes
 configuration compatibility, tensor/pipeline parallelism, checkpoint sharding,
 mixed precision, gradient clipping, CPU/NVMe offload, and ZeRO-3 layer-wise
 prefetch, communication overlap, or layer-at-a-time parameter release.
+In particular, Stage-3 checkpoint save/load is deliberately rejected until a
+dedicated (probably sharded) format is implemented.
 
 Stage 2 registers post-accumulate-gradient hooks. When every parameter in a
 complete parameter bucket is ready, the hook flattens and pads its gradients,

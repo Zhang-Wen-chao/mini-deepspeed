@@ -32,8 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage3-rtol",
         type=float,
-        default=2e-5,
-        help="Stage-3 NCCL comparison relative tolerance; all-reduce and full reduce-scatter use different FP32 trees",
+        default=0.0,
+        help="Stage-3 NCCL comparison relative tolerance; default keeps the observed FP32 tree difference absolute",
     )
     parser.add_argument(
         "--stage3-atol",
@@ -46,12 +46,13 @@ def parse_args() -> argparse.Namespace:
 
 def run_stage(
     stage: int, device: torch.device, rank: int, steps: int, reduce_bucket_size: int
-) -> tuple[torch.Tensor, object]:
+) -> tuple[list[torch.Tensor], object]:
     torch.manual_seed(314)
     engine = mds.initialize(
         ToyRegressor().to(device),
         {"zero_stage": stage, "lr": 1e-3, "reduce_bucket_size": reduce_bucket_size},
     )
+    history: list[torch.Tensor] = []
     for step in range(steps):
         generator = torch.Generator(device=device).manual_seed(9000 + step * 97 + rank)
         inputs = torch.randn(16, 32, generator=generator, device=device)
@@ -59,9 +60,9 @@ def run_stage(
         loss = F.mse_loss(engine(inputs), targets)
         engine.backward(loss)
         engine.step()
+        history.append(engine.parameter_vector())
         engine.zero_grad()
-    flat = engine.parameter_vector()
-    return flat, engine.report()
+    return history, engine.report()
 
 
 def assert_replicas(flat: torch.Tensor) -> None:
@@ -88,21 +89,24 @@ def main() -> None:
     dist.init_process_group(backend=backend)
     rank = dist.get_rank()
 
-    baseline, baseline_report = run_stage(0, device, rank, args.steps, args.reduce_bucket_size)
-    assert_replicas(baseline)
+    baseline_history, baseline_report = run_stage(0, device, rank, args.steps, args.reduce_bucket_size)
+    assert_replicas(baseline_history[-1])
     for stage in (1, 2, 3):
-        actual, report = run_stage(stage, device, rank, args.steps, args.reduce_bucket_size)
-        assert_replicas(actual)
-        if stage == 3:
-            torch.testing.assert_close(actual, baseline, rtol=args.stage3_rtol, atol=args.stage3_atol)
-        else:
-            torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
+        actual_history, report = run_stage(stage, device, rank, args.steps, args.reduce_bucket_size)
+        assert_replicas(actual_history[-1])
+        max_error = 0.0
+        for actual, baseline in zip(actual_history, baseline_history, strict=True):
+            max_error = max(max_error, max_abs_error(actual, baseline))
+            if stage == 3:
+                torch.testing.assert_close(actual, baseline, rtol=args.stage3_rtol, atol=args.stage3_atol)
+            else:
+                torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
         if rank == 0:
             print(
                 f"ZeRO-{stage} == ZeRO-0 after {args.steps} steps; "
                 f"state={report.model_state_elements} vs {baseline_report.model_state_elements}; "
                 f"world_size={dist.get_world_size()}; buckets={report.gradient_bucket_count}; "
-                f"max_abs_error={max_abs_error(actual, baseline):.3e}; sync={report.synchronization}"
+                f"max_abs_error_over_steps={max_error:.3e}; sync={report.synchronization}"
             )
     if rank == 0:
         print("PASS: every rank's ZeRO-0/1/2/3 parameter vectors are numerically equal")

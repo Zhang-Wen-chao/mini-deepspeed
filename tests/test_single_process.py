@@ -90,6 +90,57 @@ def test_stage_three_abort_forward_releases_parameters_and_requires_reset() -> N
     engine.step()
 
 
+def test_stage_three_rejects_checkpoints_while_parameters_are_sharded() -> None:
+    engine = mds.initialize(make_model(), {"zero_stage": 3})
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.state_dict()
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.load_state_dict({})
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.module.state_dict()
+    with pytest.raises(RuntimeError, match="checkpointing is not implemented"):
+        engine.module.load_state_dict({})
+
+
+def test_parameter_view_is_rejected_before_zero_ownership_is_created() -> None:
+    class ParameterView(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(4))
+            self.view = nn.Parameter(self.weight[:2])
+
+    with pytest.raises(ValueError, match="Parameter views or shared storage"):
+        mds.initialize(ParameterView(), {"zero_stage": 3})
+
+
+def test_ordinary_weight_tying_remains_supported() -> None:
+    class TiedRegressor(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = nn.Linear(3, 3, bias=False)
+            self.second = nn.Linear(3, 3, bias=False)
+            self.second.weight = self.first.weight
+
+        def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+            return self.second(torch.tanh(self.first(inputs)))
+
+    torch.manual_seed(91)
+    reference = TiedRegressor()
+    inputs, targets = torch.randn(5, 3), torch.randn(5, 3)
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=2e-3, weight_decay=0.1)
+    F.mse_loss(reference(inputs), targets).backward()
+    reference_optimizer.step()
+    expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
+
+    for stage in (0, 1, 2, 3):
+        torch.manual_seed(91)
+        model = TiedRegressor()
+        engine = mds.initialize(model, {"zero_stage": stage, "lr": 2e-3, "weight_decay": 0.1})
+        engine.backward(F.mse_loss(engine(inputs), targets))
+        engine.step()
+        torch.testing.assert_close(engine.parameter_vector(), expected, rtol=1e-6, atol=1e-7)
+
+
 def test_stage_three_accumulated_backwards_match_one_combined_loss() -> None:
     inputs0, targets0 = torch.randn(5, 3), torch.randn(5, 2)
     inputs1, targets1 = torch.randn(5, 3), torch.randn(5, 2)

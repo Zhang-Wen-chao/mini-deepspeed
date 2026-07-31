@@ -18,14 +18,19 @@ class DeepSpeedEngine(nn.Module):
         super().__init__()
         self.module = module
         self.optimizer = ZeroOptimizer(module.parameters(), config)
+        if config.stage == 3:
+            self.module.register_state_dict_pre_hook(self._reject_stage3_module_state_dict)
+            self.module.register_load_state_dict_pre_hook(self._reject_stage3_module_load_state_dict)
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
         self.optimizer.prepare_forward()
         try:
-            return self.module(*args, **kwargs)
-        except BaseException:
-            self.optimizer.abort_forward()
+            output = self.module(*args, **kwargs)
+        except BaseException as error:
+            self.optimizer.finish_forward(error)
             raise
+        self.optimizer.finish_forward(None)
+        return output
 
     def backward(self, loss: Tensor) -> None:
         self.optimizer.backward(loss)
@@ -46,6 +51,43 @@ class DeepSpeedEngine(nn.Module):
     def parameter_vector(self) -> Tensor:
         """Return a detached full trainable parameter vector for inspection."""
         return self.optimizer.parameter_vector()
+
+    def state_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Reject Stage-3 checkpoints until a dedicated sharded format exists."""
+        if self.optimizer.config.stage == 3:
+            raise RuntimeError(
+                "ZeRO-3 checkpointing is not implemented; engine.state_dict() cannot safely serialize "
+                "sharded parameters or optimizer state."
+            )
+        return super().state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
+        """Reject unsupported Stage-3 checkpoint restoration."""
+        if self.optimizer.config.stage == 3:
+            raise RuntimeError(
+                "ZeRO-3 checkpointing is not implemented; engine.load_state_dict() cannot safely restore "
+                "sharded parameters or optimizer state."
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def _reject_stage3_module_state_dict(self, module: nn.Module, prefix: str, keep_vars: bool) -> None:
+        raise RuntimeError(
+            "ZeRO-3 checkpointing is not implemented; module.state_dict() would expose invalid "
+            "parameter storage."
+        )
+
+    def _reject_stage3_module_load_state_dict(
+        self,
+        module: nn.Module,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        raise RuntimeError("ZeRO-3 checkpointing is not implemented; module.load_state_dict() is unavailable.")
 
 
 def initialize(module: nn.Module, config: ZeroConfig | Mapping[str, Any] | None = None) -> DeepSpeedEngine:
