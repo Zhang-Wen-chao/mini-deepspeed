@@ -366,9 +366,22 @@ class ZeroOptimizer:
             raise RuntimeError("ZeRO-3 requires engine.forward(inputs) before engine.backward(loss)")
         if self._stage3_invalidated:
             raise RuntimeError("ZeRO-3 accumulation was invalidated; call zero_grad() before backward")
-        if self._synchronize_stage3_failure(False):
+        # A retained graph backpropagated outside the engine (for example
+        # loss.backward(retain_graph=True)) would accumulate a second, silent
+        # gradient copy into the same .grad tensors. Reject any pre-existing
+        # trainable gradient before autograd runs, and coordinate the failure
+        # so that a rank-local bypass invalidates every rank.
+        preexisting = [index for index, parameter in enumerate(self.layout.parameters) if parameter.grad is not None]
+        if self._synchronize_stage3_failure(bool(preexisting)):
             self._invalidate_stage3()
-            raise RuntimeError("ZeRO-3 forward failed on at least one rank; all ranks must reset together")
+            if preexisting:
+                raise RuntimeError(
+                    "ZeRO-3 found pre-existing trainable gradients before engine.backward(); "
+                    "a graph was backpropagated outside the engine; all ranks must reset together"
+                )
+            raise RuntimeError(
+                "ZeRO-3 forward or gradient state failed on another rank; all ranks must reset together"
+            )
 
         local_error: BaseException | None = None
         missing: list[int] = []

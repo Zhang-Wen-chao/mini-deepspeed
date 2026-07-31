@@ -90,6 +90,38 @@ def test_stage_three_abort_forward_releases_parameters_and_requires_reset() -> N
     engine.step()
 
 
+def test_stage_three_rejects_preexisting_gradients_and_recovers() -> None:
+    inputs, targets = torch.randn(5, 3), torch.randn(5, 2)
+    engine = mds.initialize(make_model(), {"zero_stage": 3, "lr": 2e-3, "weight_decay": 0.1})
+    loss = F.mse_loss(engine(inputs), targets)
+    # Bypass the engine with a retained backward: engine.backward would
+    # otherwise accumulate a second, silent gradient copy.
+    loss.backward(retain_graph=True)
+    with pytest.raises(RuntimeError, match="pre-existing trainable gradients"):
+        engine.backward(loss)
+    assert all(parameter.numel() == 0 for parameter in engine.module.parameters())
+    with pytest.raises(RuntimeError, match="invalidated"):
+        engine.step()
+
+    # zero_grad() clears both the retained gradients and the invalidated window.
+    engine.zero_grad()
+    engine.backward(F.mse_loss(engine(inputs), targets))
+    engine.step()
+
+    fresh = mds.initialize(make_model(), {"zero_stage": 3, "lr": 2e-3, "weight_decay": 0.1})
+    fresh.backward(F.mse_loss(fresh(inputs), targets))
+    fresh.step()
+    torch.testing.assert_close(engine.parameter_vector(), fresh.parameter_vector(), rtol=1e-6, atol=1e-7)
+
+    # A plain (non-retained) direct backward also leaves gradients behind and
+    # is rejected for the same reason, before autograd's second-pass error.
+    engine2 = mds.initialize(make_model(), {"zero_stage": 3})
+    loss2 = F.mse_loss(engine2(torch.randn(5, 3)), torch.randn(5, 2))
+    loss2.backward()
+    with pytest.raises(RuntimeError, match="pre-existing trainable gradients"):
+        engine2.backward(loss2)
+
+
 def test_stage_three_rejects_checkpoints_while_parameters_are_sharded() -> None:
     engine = mds.initialize(make_model(), {"zero_stage": 3})
     with pytest.raises(RuntimeError, match="checkpointing is not implemented"):

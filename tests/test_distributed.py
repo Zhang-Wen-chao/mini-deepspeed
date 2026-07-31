@@ -145,6 +145,11 @@ def _failure_worker(rank: int, world_size: int, init_file: str, result_file: str
                     loss = F.mse_loss(output.detach(), targets)
                 else:
                     loss = F.mse_loss(output, targets)
+                if mode == "pregrad" and rank == 1:
+                    # rank 1 bypasses the engine with a retained backward,
+                    # leaving pre-existing gradients that must invalidate both
+                    # ranks before any reduce-scatter.
+                    loss.backward(retain_graph=True)
                 engine.backward(loss)
         assert all(parameter.numel() == 0 for parameter in model.parameters())
 
@@ -164,7 +169,7 @@ def _failure_worker(rank: int, world_size: int, init_file: str, result_file: str
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("mode", ["skip", "raise", "detached"])
+@pytest.mark.parametrize("mode", ["skip", "raise", "detached", "pregrad"])
 def test_stage_three_rank_local_failure_is_coordinated(mode: str) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)

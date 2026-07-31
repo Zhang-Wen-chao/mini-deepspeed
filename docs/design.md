@@ -49,13 +49,14 @@ change persistent ownership.
 
 During a normal engine-mediated forward, a module exception is synchronized so
 that every rank releases its materialization and raises. Likewise, after a
-backward each rank synchronizes whether it saw an exception or a missing
-trainable gradient before any reduce-scatter begins. The resulting invalidated
-window is recoverable only when **every** rank calls `zero_grad()` and resumes
-the same schedule. This prevents the common case where one rank raises locally
-while peers block in a later collective; it cannot make arbitrary
-rank-divergent engine calls safe, which is a fundamental constraint of
-synchronous collectives.
+backward each rank synchronizes whether it saw an exception, a missing
+trainable gradient, or pre-existing `.grad` tensors left by a backward that
+ran outside the engine, before any reduce-scatter begins. The resulting
+invalidated window is recoverable only when **every** rank calls `zero_grad()`
+and resumes the same schedule. This prevents the common case where one rank
+raises locally while peers block in a later collective; it cannot make
+arbitrary rank-divergent engine calls safe, which is a fundamental constraint
+of synchronous collectives.
 
 There is no Stage-3 checkpoint API. State-dict save/load is explicitly
 rejected on the engine, on the module, and on every submodule while no sharded

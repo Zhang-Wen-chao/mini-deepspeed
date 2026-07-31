@@ -65,13 +65,14 @@ distributed launch `abort_forward()` is a coordinated call: every rank must
 call it together, otherwise the ranks that call it block while the peers
 proceed.
 
-In distributed Stage 3, an ordinary rank-local module-forward failure or a
-backward with missing trainable gradients is detected before the next
-reduce-scatter. Every rank releases its materialization and raises, then every
-rank must call `zero_grad()` before resuming. This does not relax the normal
-distributed contract: all ranks must still follow the same engine API and
-collective schedule; rank-divergent user control flow can still deadlock any
-synchronous collective program.
+In distributed Stage 3, an ordinary rank-local module-forward failure, a
+backward with missing trainable gradients, or a backward that runs over a
+graph already backpropagated outside the engine (pre-existing `.grad`
+tensors) is detected before the next reduce-scatter. Every rank releases its
+materialization and raises, then every rank must call `zero_grad()` before
+resuming. This does not relax the normal distributed contract: all ranks must
+still follow the same engine API and collective schedule; rank-divergent user
+control flow can still deadlock any synchronous collective program.
 
 Stage 3 intentionally has no checkpoint format yet. `engine.state_dict()`,
 `engine.load_state_dict()`, and `state_dict()` / `load_state_dict()` on the
