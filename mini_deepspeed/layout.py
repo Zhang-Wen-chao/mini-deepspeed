@@ -78,7 +78,12 @@ class FlatParameterLayout:
         """Copy an updated padded vector into the model parameters."""
         if padded.numel() != self.padded_numel:
             raise ValueError("tensor must have the layout's padded size")
-        flat = padded.narrow(0, 0, self.numel)
+        self.assign_flat(padded.narrow(0, 0, self.numel))
+
+    def assign_flat(self, flat: torch.Tensor) -> None:
+        """Copy an updated unpadded vector into the model parameters."""
+        if flat.numel() != self.numel:
+            raise ValueError("tensor must have the layout's unpadded size")
         with torch.no_grad():
             for parameter, span in zip(self.parameters, self.spans, strict=True):
                 parameter.copy_(flat[span.start : span.end].view(span.shape))

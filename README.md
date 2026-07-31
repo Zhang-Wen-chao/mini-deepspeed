@@ -19,7 +19,8 @@ The first version implements a compact AdamW training engine for ZeRO Stages
 
 For `P` parameters and `N` data-parallel ranks, this gives the persistent
 state model below (ignoring activations, temporary buffers, and communication
-padding). Stage 2 reports the sum of equal shard lengths for its gradient
+padding). These are logical retained-state counts, not CUDA allocator peak
+measurements. Stage 2 reports the sum of equal shard lengths for its gradient
 buckets, so every bucket can contribute final-shard padding when its size is
 not divisible by `N`:
 
@@ -71,9 +72,11 @@ torchrun --standalone --nproc_per_node=2 examples/train_toy.py --zero-stage 2 --
 torchrun --standalone --nproc_per_node=2 examples/validate_equivalence.py --device cpu --steps 4
 ```
 
-On a Gloo build that does not provide `reduce_scatter`, ZeRO-2 takes a clearly
-labelled all-reduce-and-slice correctness fallback. NCCL uses PyTorch's native
-`reduce_scatter_tensor` path.
+On Gloo, ZeRO-2 takes a clearly labelled all-reduce-and-slice correctness
+fallback: every rank receives the full padded gradient before retaining its
+slice, so it is more communication-heavy than native reduce-scatter. NCCL uses
+PyTorch's native `reduce_scatter_tensor` path. Other distributed backends are
+explicitly rejected.
 
 ## L20 multi-GPU run
 
@@ -119,12 +122,16 @@ replicas equal, and matches ZeRO-1/2 against the Stage-0 baseline.
 launch.
 
 `examples/compare_deepspeed.py` is the external reference check. It runs the
-same model, per-rank deterministic inputs, AdamW configuration, and gradient
-accumulation semantics against DeepSpeed ZeRO-0/1/2, then compares final
-parameters element by element. The L20 result passed for DeepSpeed 0.19.3 and
-PyTorch 2.10.0a0 on both 2 and 4 GPUs; the four-GPU maximum absolute error was
-at most `7.451e-09`. DeepSpeed is installed only in an isolated validation
-environment and is not a runtime dependency of this project.
+same model, per-rank deterministic inputs, AdamW configuration (including
+non-zero weight decay), and gradient-accumulation semantics against DeepSpeed
+ZeRO-0/1/2. It asserts equal replicated initial parameters before training and
+then compares final parameters element by element. The DeepSpeed loop follows
+its public GAS protocol: it calls `engine.step()` after every microbatch and
+asserts the documented accumulation boundary and `global_steps` behavior. The
+L20 result passed for DeepSpeed 0.19.3 and PyTorch 2.10.0a0 on both 2 and 4
+GPUs; the four-GPU maximum absolute error was at most `7.451e-09`. DeepSpeed
+is installed only in an isolated validation environment and is not a runtime
+dependency of this project.
 
 ## Scope and next work
 

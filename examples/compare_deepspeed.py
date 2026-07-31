@@ -37,10 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--microbatches", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--reduce-bucket-size", type=int, default=10)
     parser.add_argument("--rtol", type=float, default=1e-6)
     parser.add_argument("--atol", type=float, default=1e-7)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.steps <= 0 or args.microbatches <= 0:
+        parser.error("--steps and --microbatches must be positive")
+    return args
 
 
 def _require_deepspeed() -> Any:
@@ -73,16 +77,21 @@ def _assert_replicated(flat: torch.Tensor, rtol: float, atol: float) -> None:
         torch.testing.assert_close(replica, replicas[0], rtol=rtol, atol=atol)
 
 
-def _run_mini(stage: int, args: argparse.Namespace, rank: int, device: torch.device) -> torch.Tensor:
+def _run_mini(
+    stage: int, args: argparse.Namespace, rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(314)
     engine = mds.initialize(
         ReferenceRegressor().to(device),
         {
             "zero_stage": stage,
             "lr": args.lr,
+            "weight_decay": args.weight_decay,
             "reduce_bucket_size": args.reduce_bucket_size,
         },
     )
+    initial = _flatten(engine.module).clone()
+    _assert_replicated(initial, args.rtol, args.atol)
     for step in range(args.steps):
         engine.zero_grad()
         for microbatch in range(args.microbatches):
@@ -91,7 +100,7 @@ def _run_mini(stage: int, args: argparse.Namespace, rank: int, device: torch.dev
         engine.step()
     flat = _flatten(engine.module)
     _assert_replicated(flat, args.rtol, args.atol)
-    return flat
+    return initial, flat
 
 
 def _deepspeed_config(stage: int, args: argparse.Namespace) -> dict[str, Any]:
@@ -112,7 +121,7 @@ def _deepspeed_config(stage: int, args: argparse.Namespace) -> dict[str, Any]:
                 "lr": args.lr,
                 "betas": [0.9, 0.999],
                 "eps": 1e-8,
-                "weight_decay": 0.0,
+                "weight_decay": args.weight_decay,
                 # Demand PyTorch AdamW so the reference optimizer has the same
                 # public semantics as mini-deepspeed's explicit AdamW update.
                 "torch_adam": True,
@@ -130,7 +139,7 @@ def _deepspeed_config(stage: int, args: argparse.Namespace) -> dict[str, Any]:
 
 def _run_deepspeed(
     deepspeed: Any, stage: int, args: argparse.Namespace, rank: int, device: torch.device
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(314)
     module = ReferenceRegressor().to(device)
     engine, _, _, _ = deepspeed.initialize(
@@ -139,6 +148,8 @@ def _run_deepspeed(
         config=_deepspeed_config(stage, args),
         dist_init_required=False,
     )
+    initial = _flatten(engine.module).clone()
+    _assert_replicated(initial, args.rtol, args.atol)
     for step in range(args.steps):
         engine.zero_grad()
         for microbatch in range(args.microbatches):
@@ -147,10 +158,19 @@ def _run_deepspeed(
             # ``backward()``. Disable its default loss/GAS scaling: mini's
             # engine deliberately accumulates the same unscaled gradient sum.
             engine.backward(F.mse_loss(engine(inputs), targets), scale_wrt_gas=False)
+            expected_boundary = microbatch + 1 == args.microbatches
+            if engine.is_gradient_accumulation_boundary() != expected_boundary:
+                raise RuntimeError(
+                    "DeepSpeed accumulation boundary did not match gradient_accumulation_steps"
+                )
+            previous_global_steps = engine.global_steps
             engine.step()
+            expected_global_steps = previous_global_steps + int(expected_boundary)
+            if engine.global_steps != expected_global_steps:
+                raise RuntimeError("DeepSpeed step did not follow its documented accumulation boundary")
     flat = _flatten(engine.module)
     _assert_replicated(flat, args.rtol, args.atol)
-    return flat
+    return initial, flat
 
 
 def _max_abs_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -173,13 +193,14 @@ def main() -> None:
                 f"world_size={dist.get_world_size()}; dtype=float32"
             )
         for stage in (0, 1, 2):
-            mini_parameters = _run_mini(stage, args, rank, device)
+            mini_initial, mini_parameters = _run_mini(stage, args, rank, device)
             dist.barrier()
-            deepspeed_parameters = _run_deepspeed(deepspeed, stage, args, rank, device)
+            deepspeed_initial, deepspeed_parameters = _run_deepspeed(deepspeed, stage, args, rank, device)
+            torch.testing.assert_close(deepspeed_initial, mini_initial, rtol=args.rtol, atol=args.atol)
             torch.testing.assert_close(deepspeed_parameters, mini_parameters, rtol=args.rtol, atol=args.atol)
             if rank == 0:
                 print(
-                    f"PASS: mini ZeRO-{stage} == DeepSpeed ZeRO-{stage}; "
+                    f"PASS: mini ZeRO-{stage} initial and final parameters == DeepSpeed; "
                     f"max_abs_error={_max_abs_error(deepspeed_parameters, mini_parameters):.3e}"
                 )
         if rank == 0:

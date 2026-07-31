@@ -17,19 +17,39 @@ import mini_deepspeed as mds
 _REDUCE_BUCKET_SIZE = 10
 
 
-def _make_model() -> nn.Module:
+class _DivisibleRegressor(nn.Module):
+    """64 trainable elements, each parameter tensor divisible by four."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(nn.Linear(4, 4), nn.Tanh(), nn.Linear(4, 8))
+        self.offset = nn.Parameter(torch.zeros(4))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.layers(inputs) + self.offset.repeat(2)
+
+
+def _make_model(numel: int = 65) -> nn.Module:
     # 4*9 + 9 + 9*2 + 2 = 65 trainable elements. It is deliberately not
     # divisible by the two or four ranks exercised below.
-    return nn.Sequential(nn.Linear(4, 9), nn.Tanh(), nn.Linear(9, 2))
+    if numel == 65:
+        return nn.Sequential(nn.Linear(4, 9), nn.Tanh(), nn.Linear(9, 2))
+    if numel == 64:
+        # 4*4 + 4 + 4*8 + 8 + 4 = 64. Individual tensors (16, 4,
+        # 32, 8, 4) and therefore every bucket are divisible by 2 and 4.
+        return _DivisibleRegressor()
+    raise ValueError(f"unsupported test parameter count: {numel}")
 
 
-def _worker(rank: int, world_size: int, init_file: str, stage: int, result_file: str) -> None:
+def _worker(
+    rank: int, world_size: int, init_file: str, stage: int, result_file: str, model_numel: int = 65
+) -> None:
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         # Different construction seeds verify that initialization is broadcast
         # from rank 0, as DDP and DeepSpeed require for data-parallel replicas.
         torch.manual_seed(22 + rank)
-        model = _make_model()
+        model = _make_model(model_numel)
         engine = mds.initialize(
             model,
             {"zero_stage": stage, "lr": 5e-3, "reduce_bucket_size": _REDUCE_BUCKET_SIZE},
@@ -43,7 +63,7 @@ def _worker(rank: int, world_size: int, init_file: str, stage: int, result_file:
             for microbatch in range(2):
                 torch.manual_seed(100 + step * 20 + microbatch * 5 + rank)
                 inputs = torch.randn(6, 4)
-                targets = torch.randn(6, 2)
+                targets = torch.randn(6, 2 if model_numel == 65 else 8)
                 loss = F.mse_loss(engine(inputs), targets)
                 engine.backward(loss)
                 if stage == 2:
@@ -69,10 +89,15 @@ def _worker(rank: int, world_size: int, init_file: str, stage: int, result_file:
         dist.destroy_process_group()
 
 
-def _run_stage(stage: int, world_size: int, root: Path) -> dict[str, object]:
+def _run_stage(stage: int, world_size: int, root: Path, model_numel: int = 65) -> dict[str, object]:
     init_file = root / f"gloo-init-{world_size}-{stage}"
     result_file = root / f"stage-{world_size}-{stage}.pt"
-    mp.spawn(_worker, args=(world_size, str(init_file), stage, str(result_file)), nprocs=world_size, join=True)
+    mp.spawn(
+        _worker,
+        args=(world_size, str(init_file), stage, str(result_file), model_numel),
+        nprocs=world_size,
+        join=True,
+    )
     return torch.load(result_file, weights_only=False)
 
 
@@ -105,5 +130,19 @@ def test_zero_stages_match_stage_zero_for_one_two_and_four_ranks(world_size: int
     assert stage2["gradients_released"]
     assert "Gloo fallback" in reports[2].synchronization
 
+    for result in (stage1, stage2):
+        torch.testing.assert_close(result["parameters"], stage0["parameters"], rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_zero_stages_match_with_even_parameter_shards(world_size: int) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        stage0 = _run_stage(0, world_size, root, model_numel=64)
+        stage1 = _run_stage(1, world_size, root, model_numel=64)
+        stage2 = _run_stage(2, world_size, root, model_numel=64)
+
+    assert stage0["parameters"].numel() == 64
+    assert stage2["report"].gradient_elements == 64 // world_size
     for result in (stage1, stage2):
         torch.testing.assert_close(result["parameters"], stage0["parameters"], rtol=1e-6, atol=1e-7)

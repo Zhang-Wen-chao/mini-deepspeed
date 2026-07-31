@@ -79,6 +79,7 @@ class ZeroOptimizer:
         self._backward_active = False
         self._stage2_backward_calls = 0
         self._stage2_collective_elements = 0
+        self._stage2_invalidated = False
 
         if config.stage == 2:
             self.exp_avg = None
@@ -93,6 +94,14 @@ class ZeroOptimizer:
             self.exp_avg_sq = torch.zeros_like(self.exp_avg)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
+        if self.config.stage == 2:
+            if self._backward_active:
+                raise RuntimeError("cannot clear ZeRO-2 gradients while bucket hooks are active")
+            # A standard zero_grad() starts a fresh accumulation window. In
+            # Stage 2 that includes reduce-scattered shards kept outside
+            # param.grad, not only the visible parameter gradients.
+            self._reset_stage2_accumulation()
+            self._stage2_invalidated = False
         for parameter in self.layout.parameters:
             parameter.grad = None if set_to_none else torch.zeros_like(parameter)
 
@@ -116,7 +125,7 @@ class ZeroOptimizer:
             return
         parameters = self.layout.flatten_parameters()
         dist.broadcast(parameters, src=0)
-        self.layout.assign(self.layout.pad(parameters))
+        self.layout.assign_flat(parameters)
 
     def _build_gradient_buckets(self) -> tuple[GradientBucket, ...]:
         groups: list[list[nn.Parameter]] = []
@@ -148,14 +157,20 @@ class ZeroOptimizer:
             for parameter in bucket.layout.parameters:
                 if not hasattr(parameter, "register_post_accumulate_grad_hook"):
                     raise RuntimeError("ZeRO-2 bucket hooks require PyTorch 2.1 or newer")
-                handle = parameter.register_post_accumulate_grad_hook(
-                    lambda _parameter, bucket=bucket: self._reduce_ready_bucket(bucket)
-                )
+                handle = parameter.register_post_accumulate_grad_hook(self._make_bucket_hook(bucket))
                 self._hook_handles.append(handle)
+
+    def _make_bucket_hook(self, bucket: GradientBucket):
+        def hook(_parameter: torch.Tensor) -> None:
+            self._reduce_ready_bucket(bucket)
+
+        return hook
 
     def _begin_stage2_backward(self) -> None:
         if self._backward_active:
             raise RuntimeError("cannot begin a new backward while ZeRO-2 hooks are active")
+        if self._stage2_invalidated:
+            raise RuntimeError("ZeRO-2 accumulation was invalidated; call zero_grad() before backward")
         if self._stage2_backward_calls == 0:
             self._stage2_collective_elements = 0
         self._backward_active = True
@@ -177,6 +192,10 @@ class ZeroOptimizer:
         self._stage2_backward_calls += 1
 
     def _abort_stage2_backward(self) -> None:
+        self._reset_stage2_accumulation()
+        self._stage2_invalidated = True
+
+    def _reset_stage2_accumulation(self) -> None:
         self._backward_active = False
         self._stage2_backward_calls = 0
         self._stage2_collective_elements = 0
@@ -217,7 +236,7 @@ class ZeroOptimizer:
             gradients = self.layout.flatten_gradients()
             parameters = self.layout.flatten_parameters()
             self._adamw(parameters, self._all_reduce_mean(gradients), self.exp_avg, self.exp_avg_sq)
-            self.layout.assign(self.layout.pad(parameters))
+            self.layout.assign_flat(parameters)
             self.step_count += 1
             return
 
@@ -240,6 +259,8 @@ class ZeroOptimizer:
     def _step_stage2(self) -> None:
         if self._backward_active:
             raise RuntimeError("cannot call step while ZeRO-2 backward hooks are active")
+        if self._stage2_invalidated:
+            raise RuntimeError("ZeRO-2 accumulation was invalidated; call zero_grad() before step")
         if self._stage2_backward_calls == 0:
             raise RuntimeError("ZeRO-2 step requires at least one engine.backward(loss) call")
         missing = [index for index, bucket in enumerate(self._buckets) if bucket.gradient_shard is None]
@@ -266,6 +287,7 @@ class ZeroOptimizer:
         for bucket in self._buckets:
             bucket.gradient_shard = None
         self._stage2_backward_calls = 0
+        self._stage2_invalidated = False
         self.step_count += 1
 
     def report(self) -> ZeroReport:
@@ -329,14 +351,17 @@ class ZeroOptimizer:
         if not self._distributed:
             return layout.local_shard(padded_gradients, self.rank)
         output = torch.empty_like(layout.local_shard(padded_gradients, self.rank))
-        if dist.get_backend() == "nccl":
+        backend = dist.get_backend()
+        if backend == "nccl":
             dist.reduce_scatter_tensor(output, padded_gradients, op=dist.ReduceOp.SUM)
-        else:
+        elif backend == "gloo":
             # Gloo builds often omit reduce_scatter. This preserves exact
             # ZeRO-2 math for CPU tests while labelling the non-efficient path.
             reduced = padded_gradients.clone()
             dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
             output.copy_(layout.local_shard(reduced, self.rank))
+        else:
+            raise RuntimeError(f"ZeRO-2 supports NCCL and Gloo, not distributed backend {backend!r}")
         output.div_(self.world_size)
         self._stage2_collective_elements += layout.padded_numel
         return output

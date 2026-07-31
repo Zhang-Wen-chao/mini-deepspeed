@@ -44,6 +44,10 @@ post-accumulate-gradient hook records each parameter's readiness during
 then all-gathers the updated parameter shards so every rank still has a full
 forward model. Multiple `engine.backward()` calls before one `step()` add raw
 gradient sums, and every complete bucket must participate in every backward.
+Calling `zero_grad()` discards any retained Stage-2 gradient shards and starts
+a fresh accumulation window. A failed or incomplete backward invalidates that
+window; the caller must call `zero_grad()` before another `backward()` or
+`step()`.
 
 ## Scope boundary
 
