@@ -87,3 +87,19 @@ class FlatParameterLayout:
         with torch.no_grad():
             for parameter, span in zip(self.parameters, self.spans, strict=True):
                 parameter.copy_(flat[span.start : span.end].view(span.shape))
+
+    def materialize(self, padded: torch.Tensor) -> None:
+        """Make full parameter tensors view a gathered padded vector."""
+        if padded.numel() != self.padded_numel:
+            raise ValueError("tensor must have the layout's padded size")
+        flat = padded.narrow(0, 0, self.numel)
+        with torch.no_grad():
+            for parameter, span in zip(self.parameters, self.spans, strict=True):
+                parameter.data = flat[span.start : span.end].view(span.shape)
+
+    def release(self) -> None:
+        """Drop full parameter storage while retaining parameter identities."""
+        with torch.no_grad():
+            for parameter in self.parameters:
+                parameter.grad = None
+                parameter.data = torch.empty(0, device=parameter.device, dtype=parameter.dtype)

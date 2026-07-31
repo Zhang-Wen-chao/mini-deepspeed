@@ -1,4 +1,4 @@
-"""Prove that ZeRO-0/1/2 produce equal two-rank updates on one device type."""
+"""Prove that ZeRO-0/1/2/3 produce equal distributed updates."""
 
 from __future__ import annotations
 
@@ -29,6 +29,18 @@ def parse_args() -> argparse.Namespace:
         default=1_048_576,
         help="ZeRO-2 bucket target in parameter elements",
     )
+    parser.add_argument(
+        "--stage3-rtol",
+        type=float,
+        default=2e-5,
+        help="Stage-3 NCCL comparison relative tolerance; all-reduce and full reduce-scatter use different FP32 trees",
+    )
+    parser.add_argument(
+        "--stage3-atol",
+        type=float,
+        default=3e-7,
+        help="Stage-3 NCCL comparison absolute tolerance",
+    )
     return parser.parse_args()
 
 
@@ -48,7 +60,7 @@ def run_stage(
         engine.backward(loss)
         engine.step()
         engine.zero_grad()
-    flat = torch.cat([parameter.detach().reshape(-1) for parameter in engine.module.parameters()])
+    flat = engine.parameter_vector()
     return flat, engine.report()
 
 
@@ -58,6 +70,10 @@ def assert_replicas(flat: torch.Tensor) -> None:
     dist.all_gather(replicas, flat)
     for replica in replicas[1:]:
         torch.testing.assert_close(replica, replicas[0], rtol=1e-6, atol=1e-7)
+
+
+def max_abs_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    return (actual - expected).abs().max().item()
 
 
 def main() -> None:
@@ -74,19 +90,22 @@ def main() -> None:
 
     baseline, baseline_report = run_stage(0, device, rank, args.steps, args.reduce_bucket_size)
     assert_replicas(baseline)
-    for stage in (1, 2):
+    for stage in (1, 2, 3):
         actual, report = run_stage(stage, device, rank, args.steps, args.reduce_bucket_size)
         assert_replicas(actual)
-        torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
+        if stage == 3:
+            torch.testing.assert_close(actual, baseline, rtol=args.stage3_rtol, atol=args.stage3_atol)
+        else:
+            torch.testing.assert_close(actual, baseline, rtol=1e-6, atol=1e-7)
         if rank == 0:
             print(
                 f"ZeRO-{stage} == ZeRO-0 after {args.steps} steps; "
                 f"state={report.model_state_elements} vs {baseline_report.model_state_elements}; "
                 f"world_size={dist.get_world_size()}; buckets={report.gradient_bucket_count}; "
-                f"sync={report.synchronization}"
+                f"max_abs_error={max_abs_error(actual, baseline):.3e}; sync={report.synchronization}"
             )
     if rank == 0:
-        print("PASS: every rank's ZeRO-0/1/2 parameter vectors are numerically equal")
+        print("PASS: every rank's ZeRO-0/1/2/3 parameter vectors are numerically equal")
     dist.destroy_process_group()
 
 

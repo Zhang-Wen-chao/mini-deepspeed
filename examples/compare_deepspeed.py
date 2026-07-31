@@ -1,4 +1,4 @@
-"""Compare mini-deepspeed ZeRO-0/1/2 directly against DeepSpeed."""
+"""Compare mini-deepspeed ZeRO-0/1/2/3 directly against DeepSpeed."""
 
 from __future__ import annotations
 
@@ -70,6 +70,14 @@ def _flatten(module: nn.Module) -> torch.Tensor:
     return torch.cat([parameter.detach().reshape(-1) for parameter in module.parameters()])
 
 
+def _flatten_deepspeed(deepspeed: Any, module: nn.Module, stage: int) -> torch.Tensor:
+    """Gather Stage-3 parameter shards only while inspecting the reference."""
+    if stage != 3:
+        return _flatten(module)
+    with deepspeed.zero.GatheredParameters(list(module.parameters()), modifier_rank=None):
+        return _flatten(module).clone()
+
+
 def _assert_replicated(flat: torch.Tensor, rtol: float, atol: float) -> None:
     replicas = [torch.empty_like(flat) for _ in range(dist.get_world_size())]
     dist.all_gather(replicas, flat)
@@ -90,7 +98,7 @@ def _run_mini(
             "reduce_bucket_size": args.reduce_bucket_size,
         },
     )
-    initial = _flatten(engine.module).clone()
+    initial = engine.parameter_vector()
     _assert_replicated(initial, args.rtol, args.atol)
     for step in range(args.steps):
         engine.zero_grad()
@@ -98,7 +106,7 @@ def _run_mini(
             inputs, targets = _batch(step, microbatch, rank, device)
             engine.backward(F.mse_loss(engine(inputs), targets))
         engine.step()
-    flat = _flatten(engine.module)
+    flat = engine.parameter_vector()
     _assert_replicated(flat, args.rtol, args.atol)
     return initial, flat
 
@@ -148,7 +156,7 @@ def _run_deepspeed(
         config=_deepspeed_config(stage, args),
         dist_init_required=False,
     )
-    initial = _flatten(engine.module).clone()
+    initial = _flatten_deepspeed(deepspeed, engine.module, stage)
     _assert_replicated(initial, args.rtol, args.atol)
     for step in range(args.steps):
         engine.zero_grad()
@@ -168,7 +176,7 @@ def _run_deepspeed(
             expected_global_steps = previous_global_steps + int(expected_boundary)
             if engine.global_steps != expected_global_steps:
                 raise RuntimeError("DeepSpeed step did not follow its documented accumulation boundary")
-    flat = _flatten(engine.module)
+    flat = _flatten_deepspeed(deepspeed, engine.module, stage)
     _assert_replicated(flat, args.rtol, args.atol)
     return initial, flat
 
@@ -192,7 +200,7 @@ def main() -> None:
                 f"reference: DeepSpeed {deepspeed.__version__}; PyTorch {torch.__version__}; "
                 f"world_size={dist.get_world_size()}; dtype=float32"
             )
-        for stage in (0, 1, 2):
+        for stage in (0, 1, 2, 3):
             mini_initial, mini_parameters = _run_mini(stage, args, rank, device)
             dist.barrier()
             deepspeed_initial, deepspeed_parameters = _run_deepspeed(deepspeed, stage, args, rank, device)
@@ -204,7 +212,7 @@ def main() -> None:
                     f"max_abs_error={_max_abs_error(deepspeed_parameters, mini_parameters):.3e}"
                 )
         if rank == 0:
-            print("PASS: all DeepSpeed ZeRO-0/1/2 reference comparisons matched")
+            print("PASS: all DeepSpeed ZeRO-0/1/2/3 reference comparisons matched")
     finally:
         dist.destroy_process_group()
 

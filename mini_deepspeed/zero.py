@@ -1,4 +1,4 @@
-"""A compact, explicit implementation of ZeRO stages 0, 1 and 2."""
+"""A compact, explicit implementation of ZeRO stages 0 through 3."""
 
 from __future__ import annotations
 
@@ -19,7 +19,9 @@ class ZeroConfig:
 
     ``reduce_bucket_size`` is measured in parameter elements. ZeRO-2 groups
     whole, consecutive parameters into buckets no smaller than a parameter,
-    then reduce-scatters a bucket as soon as autograd finishes it.
+    then reduce-scatters a bucket as soon as autograd finishes it. ZeRO-3
+    shards parameters at rest and materializes the complete model only around
+    each engine forward/backward pair.
     """
 
     stage: int = 0
@@ -30,8 +32,8 @@ class ZeroConfig:
     reduce_bucket_size: int = 1_048_576
 
     def __post_init__(self) -> None:
-        if self.stage not in (0, 1, 2):
-            raise ValueError("only ZeRO stages 0, 1 and 2 are implemented")
+        if self.stage not in (0, 1, 2, 3):
+            raise ValueError("only ZeRO stages 0, 1, 2 and 3 are implemented")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.eps <= 0:
@@ -59,8 +61,8 @@ class ZeroOptimizer:
     Adam moments only for a rank's parameter shard. Stage 2 registers
     post-accumulate gradient hooks: once every parameter in a bucket is ready,
     it reduce-scatters that bucket and immediately releases the full grads.
-    Updated parameter shards are all-gathered so every rank retains a complete
-    forward model.
+    Stage 3 also shards parameters at rest, eagerly all-gathering the complete
+    model for an engine forward/backward pair before releasing it again.
     """
 
     def __init__(self, parameters: Iterable[nn.Parameter], config: ZeroConfig):
@@ -80,12 +82,25 @@ class ZeroOptimizer:
         self._stage2_backward_calls = 0
         self._stage2_collective_elements = 0
         self._stage2_invalidated = False
+        self._stage3_parameter_shard: torch.Tensor | None = None
+        self._stage3_gradient_shard: torch.Tensor | None = None
+        self._stage3_parameters_materialized = False
+        self._stage3_backward_active = False
+        self._stage3_backward_calls = 0
+        self._stage3_invalidated = False
+        self._stage3_collective_elements = 0
 
         if config.stage == 2:
             self.exp_avg = None
             self.exp_avg_sq = None
             self._buckets = self._build_gradient_buckets()
             self._register_gradient_hooks()
+        elif config.stage == 3:
+            padded_parameters = self.layout.pad(self.layout.flatten_parameters())
+            self._stage3_parameter_shard = self.layout.local_shard(padded_parameters, self.rank).clone()
+            self.exp_avg = torch.zeros_like(self._stage3_parameter_shard)
+            self.exp_avg_sq = torch.zeros_like(self.exp_avg)
+            self.layout.release()
         else:
             # Only partitioned stages need the layout's communication padding.
             # Stage 0 deliberately mirrors ordinary AdamW exactly.
@@ -102,13 +117,24 @@ class ZeroOptimizer:
             # param.grad, not only the visible parameter gradients.
             self._reset_stage2_accumulation()
             self._stage2_invalidated = False
+        elif self.config.stage == 3:
+            if self._stage3_parameters_materialized:
+                raise RuntimeError("cannot clear ZeRO-3 gradients between engine.forward() and engine.backward()")
+            if not set_to_none:
+                raise ValueError("ZeRO-3 only supports zero_grad(set_to_none=True)")
+            self._reset_stage3_accumulation()
+            self._stage3_invalidated = False
         for parameter in self.layout.parameters:
             parameter.grad = None if set_to_none else torch.zeros_like(parameter)
 
     def backward(self, loss: torch.Tensor) -> None:
-        """Run backward, using hooks to reduce and release ZeRO-2 buckets."""
-        if self.config.stage != 2:
+        """Run backward and apply the selected ZeRO gradient lifecycle."""
+        if self.config.stage in (0, 1):
             loss.backward()
+            return
+
+        if self.config.stage == 3:
+            self._backward_stage3(loss)
             return
 
         self._begin_stage2_backward()
@@ -118,6 +144,39 @@ class ZeroOptimizer:
             self._abort_stage2_backward()
             raise
         self._finish_stage2_backward()
+
+    def prepare_forward(self) -> None:
+        """Materialize ZeRO-3 parameters immediately before module execution."""
+        if self.config.stage != 3:
+            return
+        if self._stage3_parameters_materialized:
+            raise RuntimeError("ZeRO-3 allows only one engine.forward() before engine.backward(loss)")
+        if self._stage3_invalidated:
+            raise RuntimeError("ZeRO-3 accumulation was invalidated; call zero_grad() before forward")
+        if self._stage3_parameter_shard is None:
+            raise RuntimeError("ZeRO-3 parameter shard is unavailable")
+        parameters = self._all_gather_shards(self._stage3_parameter_shard, self.layout)
+        self.layout.materialize(parameters)
+        self._stage3_parameters_materialized = True
+        if self._distributed:
+            self._stage3_collective_elements += self.layout.padded_numel
+
+    def abort_forward(self) -> None:
+        """Release a ZeRO-3 materialization after a failed module forward."""
+        if self.config.stage == 3 and self._stage3_parameters_materialized:
+            self.layout.release()
+            self._stage3_parameters_materialized = False
+            self._reset_stage3_accumulation()
+            self._stage3_invalidated = True
+
+    def parameter_vector(self) -> torch.Tensor:
+        """Return a full detached parameter vector without retaining ZeRO-3 params."""
+        if self.config.stage != 3:
+            return self.layout.flatten_parameters()
+        if self._stage3_parameter_shard is None:
+            raise RuntimeError("ZeRO-3 parameter shard is unavailable")
+        gathered = self._all_gather_shards(self._stage3_parameter_shard, self.layout)
+        return gathered.narrow(0, 0, self.layout.numel).clone()
 
     def _synchronize_initial_parameters(self) -> None:
         """Adopt rank 0's model once, matching ordinary DDP initialization."""
@@ -254,6 +313,10 @@ class ZeroOptimizer:
             self.step_count += 1
             return
 
+        if self.config.stage == 3:
+            self._step_stage3()
+            return
+
         self._step_stage2()
 
     def _step_stage2(self) -> None:
@@ -290,13 +353,82 @@ class ZeroOptimizer:
         self._stage2_invalidated = False
         self.step_count += 1
 
+    def _backward_stage3(self, loss: torch.Tensor) -> None:
+        if not self._stage3_parameters_materialized:
+            raise RuntimeError("ZeRO-3 requires engine.forward(inputs) before engine.backward(loss)")
+        if self._stage3_invalidated:
+            raise RuntimeError("ZeRO-3 accumulation was invalidated; call zero_grad() before backward")
+        try:
+            self._stage3_backward_active = True
+            loss.backward()
+            missing = [index for index, parameter in enumerate(self.layout.parameters) if parameter.grad is None]
+            if missing:
+                raise RuntimeError(
+                    "ZeRO-3 requires every trainable parameter to participate in each backward; "
+                    f"missing parameters={missing}"
+                )
+            padded_gradients = self.layout.pad(self.layout.flatten_gradients())
+            gradient_shard = self._reduce_scatter_mean(padded_gradients, self.layout)
+            if self._stage3_gradient_shard is None:
+                self._stage3_gradient_shard = gradient_shard
+            else:
+                self._stage3_gradient_shard.add_(gradient_shard)
+            self._stage3_backward_calls += 1
+        except BaseException:
+            self._reset_stage3_accumulation()
+            self._stage3_invalidated = True
+            raise
+        finally:
+            self._stage3_backward_active = False
+            self.layout.release()
+            self._stage3_parameters_materialized = False
+
+    def _step_stage3(self) -> None:
+        if self._stage3_parameters_materialized:
+            raise RuntimeError("cannot call step while ZeRO-3 parameters are materialized")
+        if self._stage3_invalidated:
+            raise RuntimeError("ZeRO-3 accumulation was invalidated; call zero_grad() before step")
+        if self._stage3_backward_calls == 0 or self._stage3_gradient_shard is None:
+            raise RuntimeError("ZeRO-3 step requires at least one engine.backward(loss) call")
+        if self._stage3_parameter_shard is None:
+            raise RuntimeError("ZeRO-3 parameter shard is unavailable")
+
+        self._adamw(
+            self._stage3_parameter_shard,
+            self._stage3_gradient_shard,
+            self.exp_avg,
+            self.exp_avg_sq,
+        )
+        if self._distributed:
+            backend = dist.get_backend()
+            reduction = "reduce-scatter gradients (NCCL)" if backend == "nccl" else "all-reduce + slice gradients (Gloo fallback)"
+            self._last_sync = f"all-gather parameters for forward + {reduction} + release parameters"
+            self._last_collective_elements = self._stage3_collective_elements
+        else:
+            self._last_sync = "materialize/release parameters (single process)"
+            self._last_collective_elements = 0
+        self._reset_stage3_accumulation()
+        self.step_count += 1
+
+    def _reset_stage3_accumulation(self) -> None:
+        self._stage3_gradient_shard = None
+        self._stage3_backward_calls = 0
+        self._stage3_collective_elements = 0
+
     def report(self) -> ZeroReport:
         full = self.layout.numel
         if self.config.stage == 2:
+            parameters = full
             gradients = sum(bucket.layout.shard_numel for bucket in self._buckets)
             optimizer_states = sum(bucket.exp_avg.numel() + bucket.exp_avg_sq.numel() for bucket in self._buckets)
             bucket_count = len(self._buckets)
+        elif self.config.stage == 3:
+            parameters = self.layout.shard_numel
+            gradients = self.layout.shard_numel
+            optimizer_states = self.exp_avg.numel() + self.exp_avg_sq.numel()
+            bucket_count = 1
         else:
+            parameters = full
             gradients = full
             optimizer_states = self.exp_avg.numel() + self.exp_avg_sq.numel()
             bucket_count = 1
@@ -304,7 +436,7 @@ class ZeroOptimizer:
             stage=self.config.stage,
             rank=self.rank,
             world_size=self.world_size,
-            parameter_elements=full,
+            parameter_elements=parameters,
             gradient_elements=gradients,
             optimizer_state_elements=optimizer_states,
             synchronization=self._last_sync,
@@ -361,9 +493,12 @@ class ZeroOptimizer:
             dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
             output.copy_(layout.local_shard(reduced, self.rank))
         else:
-            raise RuntimeError(f"ZeRO-2 supports NCCL and Gloo, not distributed backend {backend!r}")
+            raise RuntimeError(f"ZeRO supports NCCL and Gloo, not distributed backend {backend!r}")
         output.div_(self.world_size)
-        self._stage2_collective_elements += layout.padded_numel
+        if self.config.stage == 2:
+            self._stage2_collective_elements += layout.padded_numel
+        elif self.config.stage == 3:
+            self._stage3_collective_elements += layout.padded_numel
         return output
 
     def _all_gather_shards(self, shard: torch.Tensor, layout: FlatParameterLayout) -> torch.Tensor:

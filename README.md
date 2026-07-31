@@ -7,7 +7,7 @@ about model parallelism and large-model execution, while this repository asks
 which training states must be retained by each *data-parallel* replica.
 
 The first version implements a compact AdamW training engine for ZeRO Stages
-0, 1, and 2. It has no dependency on DeepSpeed or on `mini-megatron`.
+0 through 3. It has no dependency on DeepSpeed or on `mini-megatron`.
 
 ## What each stage owns
 
@@ -16,6 +16,7 @@ The first version implements a compact AdamW training engine for ZeRO Stages
 | Stage 0 | full | full | full | all-reduce gradients |
 | ZeRO-1 | full | full | one equal shard | all-reduce gradients, then all-gather updated parameter shards |
 | ZeRO-2 | full | one equal shard | one equal shard | reduce-scatter gradients, then all-gather updated parameter shards |
+| ZeRO-3 | one equal shard at rest | one equal shard | one equal shard | all-gather parameters for `engine.forward()`, reduce-scatter gradients, release full parameters |
 
 For `P` parameters and `N` data-parallel ranks, this gives the persistent
 state model below (ignoring activations, temporary buffers, and communication
@@ -29,6 +30,7 @@ not divisible by `N`:
 | Stage 0 | `P + P + 2P = 4P` |
 | ZeRO-1 | `P + P + 2P/N` |
 | ZeRO-2 | `P + P/N + 2P/N` |
+| ZeRO-3 | `P/N + P/N + 2P/N = 4P/N` |
 
 See [the design note](docs/design.md) for why these states differ and for the
 important memory-accounting boundary of this educational implementation.
@@ -38,9 +40,7 @@ important memory-accounting boundary of this educational implementation.
 ```python
 import mini_deepspeed as mds
 
-engine = mds.initialize(
-    model, {"zero_stage": 2, "lr": 1e-3, "reduce_bucket_size": 1_048_576}
-)
+engine = mds.initialize(model, {"zero_stage": 3, "lr": 1e-3})
 loss = loss_fn(engine(inputs), targets)
 engine.backward(loss)
 engine.step()
@@ -49,12 +49,18 @@ engine.zero_grad()
 print(engine.report())
 ```
 
-`initialize` accepts `zero_stage` 0, 1, or 2, plus `lr`, `betas`, `eps`,
+`initialize` accepts `zero_stage` 0, 1, 2, or 3, plus `lr`, `betas`, `eps`,
 `weight_decay`, and the Stage-2 `reduce_bucket_size`. Calling `backward`
 multiple times before `step` accumulates the unscaled gradient sum. The engine
 intentionally exposes only the lifecycle needed to make ownership and
 collectives easy to inspect. In a distributed launch it also broadcasts rank
 0's initial parameters once, matching DDP's replica-initialization invariant.
+
+ZeRO-3 deliberately has a narrower lifecycle: one `engine.forward()` must be
+followed by one `engine.backward(loss)`. It gathers the full model for that
+pair, then releases complete parameter tensors. `engine.parameter_vector()`
+temporarily gathers a detached full vector for testing or inspection. If a
+forward result will not be backpropagated, call `engine.abort_forward()`.
 
 ## Run locally
 
@@ -66,9 +72,9 @@ python3 -m pip install -e '.[dev]'
 python3 -m pytest -q
 
 # Two CPU/Gloo ranks
-torchrun --standalone --nproc_per_node=2 examples/train_toy.py --zero-stage 2 --device cpu
+torchrun --standalone --nproc_per_node=2 examples/train_toy.py --zero-stage 3 --device cpu
 
-# Check that stages 0, 1, and 2 end on identical parameter vectors.
+# Check that stages 0, 1, 2, and 3 end on equivalent parameter vectors.
 torchrun --standalone --nproc_per_node=2 examples/validate_equivalence.py --device cpu --steps 4
 ```
 
@@ -94,14 +100,14 @@ torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=296
 torchrun --nnodes=1 --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29700 \
   examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
 
-# Four L20s: exercise non-divisible shards and multiple Stage-2 buckets.
+# Four L20s: exercise non-divisible shards and all ZeRO stages.
 torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29741 \
   examples/validate_equivalence.py --device cuda --steps 4 --reduce-bucket-size 4096
 ```
 
 An L20/NCCL four-rank run completed the equivalence check with native
-`reduce_scatter_tensor`: ZeRO-1 and ZeRO-2 both matched ZeRO-0 after four
-steps. For the 21,768-parameter toy model, the reported per-rank retained
+`reduce_scatter_tensor`: ZeRO-1/2/3 all matched ZeRO-0 after four steps. For
+the 21,768-parameter toy model, the reported logical per-rank retained
 model-state elements were:
 
 | Stage | Parameters | Gradients | Adam states | Total |
@@ -109,6 +115,7 @@ model-state elements were:
 | 0 | 21,768 | 21,768 | 43,536 | 87,072 |
 | 1 | 21,768 | 21,768 | 21,768 | 65,304 |
 | 2 | 21,768 | 10,884 | 21,768 | 54,420 |
+| 3 | 5,442 | 5,442 | 10,884 | 21,768 |
 
 ## Verification included
 
@@ -117,19 +124,20 @@ in one process. `tests/test_distributed.py` covers world sizes 1, 2, and 4
 with a 65-parameter model (deliberately not divisible by 2 or 4), two
 different microbatches per update, and four Stage-2 buckets. It verifies that
 the hook clears complete `param.grad` tensors after each backward call, keeps
-replicas equal, and matches ZeRO-1/2 against the Stage-0 baseline.
+replicas equal, checks that ZeRO-3 releases complete parameters after each
+backward, and matches ZeRO-1/2/3 against the Stage-0 baseline.
 `examples/validate_equivalence.py` repeats the comparison under a real NCCL
 launch.
 
 `examples/compare_deepspeed.py` is the external reference check. It runs the
 same model, per-rank deterministic inputs, AdamW configuration (including
 non-zero weight decay), and gradient-accumulation semantics against DeepSpeed
-ZeRO-0/1/2. It asserts equal replicated initial parameters before training and
+ZeRO-0/1/2/3. It asserts equal replicated initial parameters before training and
 then compares final parameters element by element. The DeepSpeed loop follows
 its public GAS protocol: it calls `engine.step()` after every microbatch and
 asserts the documented accumulation boundary and `global_steps` behavior. The
 L20 result passed for DeepSpeed 0.19.3 and PyTorch 2.10.0a0 on both 2 and 4
-GPUs; the four-GPU maximum absolute error was at most `7.451e-09`. DeepSpeed
+GPUs; the four-GPU maximum absolute error was at most `1.490e-08`. DeepSpeed
 is installed only in an isolated validation environment and is not a runtime
 dependency of this project.
 
@@ -137,8 +145,8 @@ dependency of this project.
 
 This is a teaching engine, not a drop-in DeepSpeed replacement. It excludes
 configuration compatibility, tensor/pipeline parallelism, checkpoint sharding,
-mixed precision, gradient clipping, CPU/NVMe offload, and ZeRO-3 parameter
-sharding.
+mixed precision, gradient clipping, CPU/NVMe offload, and ZeRO-3 layer-wise
+prefetch, communication overlap, or layer-at-a-time parameter release.
 
 Stage 2 registers post-accumulate-gradient hooks. When every parameter in a
 complete parameter bucket is ready, the hook flattens and pads its gradients,
@@ -148,5 +156,12 @@ tensors. This proves the intended lifecycle, but is not a CUDA allocator
 peak-memory measurement: autograd still creates individual gradients, the
 implementation uses temporary flattened buffers and no communication overlap,
 and a single parameter is never split across buckets. Allocator telemetry is
-required before claiming a physical peak-memory reduction. ZeRO-3 would then
-shard parameters too, all-gathering a layer only for its forward/backward use.
+required before claiming a physical peak-memory reduction.
+
+ZeRO-3 adds parameter sharding, but its scope is intentionally explicit: it
+all-gathers the *entire* flat model immediately before one forward and releases
+it after that backward. Therefore its report proves steady-state ownership
+(`4P/N` logical model state), not a real layer-wise backward peak-memory
+reduction. Production DeepSpeed gathers and releases smaller parameter groups,
+prefetches ahead, and overlaps communication; those mechanisms are outside
+this mini implementation.

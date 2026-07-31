@@ -20,7 +20,12 @@ class DeepSpeedEngine(nn.Module):
         self.optimizer = ZeroOptimizer(module.parameters(), config)
 
     def forward(self, *args: Any, **kwargs: Any) -> Tensor:
-        return self.module(*args, **kwargs)
+        self.optimizer.prepare_forward()
+        try:
+            return self.module(*args, **kwargs)
+        except BaseException:
+            self.optimizer.abort_forward()
+            raise
 
     def backward(self, loss: Tensor) -> None:
         self.optimizer.backward(loss)
@@ -31,8 +36,16 @@ class DeepSpeedEngine(nn.Module):
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.optimizer.zero_grad(set_to_none=set_to_none)
 
+    def abort_forward(self) -> None:
+        """Discard a ZeRO-3 materialization whose loss will not be backpropagated."""
+        self.optimizer.abort_forward()
+
     def report(self) -> ZeroReport:
         return self.optimizer.report()
+
+    def parameter_vector(self) -> Tensor:
+        """Return a detached full trainable parameter vector for inspection."""
+        return self.optimizer.parameter_vector()
 
 
 def initialize(module: nn.Module, config: ZeroConfig | Mapping[str, Any] | None = None) -> DeepSpeedEngine:

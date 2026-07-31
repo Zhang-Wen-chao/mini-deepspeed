@@ -23,14 +23,14 @@ def test_zero_stages_match_adamw_in_one_process() -> None:
     reference_loss.backward()
     optimizer.step()
 
-    for stage in (0, 1, 2):
+    expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
+    for stage in (0, 1, 2, 3):
         model = make_model()
         engine = mds.initialize(model, {"zero_stage": stage, "lr": 2e-3, "weight_decay": 0.1})
         loss = F.mse_loss(engine(inputs), targets)
         engine.backward(loss)
         engine.step()
-        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
-            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(engine.parameter_vector(), expected, rtol=1e-6, atol=1e-7)
 
 
 def test_stage_reports_show_expected_ownership() -> None:
@@ -38,11 +38,15 @@ def test_stage_reports_show_expected_ownership() -> None:
     total = sum(parameter.numel() for parameter in model.parameters())
     report0 = mds.initialize(model, {"zero_stage": 0}).report()
     report2 = mds.initialize(make_model(), {"zero_stage": 2}).report()
+    report3 = mds.initialize(make_model(), {"zero_stage": 3}).report()
 
     assert report0.parameter_elements == total
     assert report0.gradient_elements == total
     assert report0.optimizer_state_elements == 2 * total
     assert report2.model_state_elements == report0.model_state_elements
+    assert report3.parameter_elements == total
+    assert report3.gradient_elements == total
+    assert report3.optimizer_state_elements == 2 * total
 
 
 def test_stage_two_requires_engine_backward_and_a_completed_backward() -> None:
@@ -56,6 +60,54 @@ def test_stage_two_requires_engine_backward_and_a_completed_backward() -> None:
     targets = torch.randn(5, 2)
     with pytest.raises(RuntimeError, match=r"engine.backward\(loss\)"):
         F.mse_loss(engine(inputs), targets).backward()
+
+
+def test_stage_three_requires_one_engine_forward_per_backward() -> None:
+    engine = mds.initialize(make_model(), {"zero_stage": 3, "reduce_bucket_size": 10})
+    inputs = torch.randn(5, 3)
+    targets = torch.randn(5, 2)
+
+    with pytest.raises(RuntimeError, match="requires engine.forward"):
+        engine.backward(torch.ones(()))
+
+    loss = F.mse_loss(engine(inputs), targets)
+    with pytest.raises(RuntimeError, match="only one engine.forward"):
+        engine(inputs)
+    engine.backward(loss)
+    assert all(parameter.numel() == 0 for parameter in engine.module.parameters())
+    engine.step()
+
+
+def test_stage_three_abort_forward_releases_parameters_and_requires_reset() -> None:
+    engine = mds.initialize(make_model(), {"zero_stage": 3})
+    engine(torch.randn(5, 3))
+    engine.abort_forward()
+    assert all(parameter.numel() == 0 for parameter in engine.module.parameters())
+    with pytest.raises(RuntimeError, match="invalidated"):
+        engine(torch.randn(5, 3))
+    engine.zero_grad()
+    engine.backward(F.mse_loss(engine(torch.randn(5, 3)), torch.randn(5, 2)))
+    engine.step()
+
+
+def test_stage_three_accumulated_backwards_match_one_combined_loss() -> None:
+    inputs0, targets0 = torch.randn(5, 3), torch.randn(5, 2)
+    inputs1, targets1 = torch.randn(5, 3), torch.randn(5, 2)
+
+    accumulated = mds.initialize(make_model(), {"zero_stage": 3, "lr": 2e-3, "weight_decay": 0.1})
+    accumulated.zero_grad()
+    accumulated.backward(F.mse_loss(accumulated(inputs0), targets0))
+    accumulated.backward(F.mse_loss(accumulated(inputs1), targets1))
+    accumulated.step()
+
+    combined = mds.initialize(make_model(), {"zero_stage": 0, "lr": 2e-3, "weight_decay": 0.1})
+    combined.zero_grad()
+    combined.backward(
+        F.mse_loss(combined(inputs0), targets0) + F.mse_loss(combined(inputs1), targets1)
+    )
+    combined.step()
+
+    torch.testing.assert_close(accumulated.parameter_vector(), combined.parameter_vector(), rtol=1e-6, atol=1e-7)
 
 
 def test_stage_two_accumulated_backwards_match_one_combined_loss() -> None:
@@ -140,7 +192,8 @@ def test_frozen_parameters_are_not_owned_or_updated() -> None:
     F.mse_loss(reference(inputs), targets).backward()
     reference_optimizer.step()
 
-    for stage in (0, 1, 2):
+    expected = torch.cat([parameter.detach().reshape(-1) for parameter in reference.parameters()])
+    for stage in (0, 1, 2, 3):
         model = make_model()
         frozen = next(model.parameters())
         frozen.requires_grad_(False)
@@ -149,6 +202,14 @@ def test_frozen_parameters_are_not_owned_or_updated() -> None:
         engine.zero_grad()
         engine.backward(F.mse_loss(engine(inputs), targets))
         engine.step()
-        assert torch.equal(frozen, frozen_before)
-        for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
-            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+        if stage != 3:
+            assert torch.equal(frozen, frozen_before)
+        # Frozen tensors are intentionally outside the ZeRO layout. Stage 3
+        # leaves them resident while its trainable vector is sharded.
+        trainable_actual = torch.cat(
+            [parameter.detach().reshape(-1) for parameter in model.parameters() if parameter.requires_grad]
+        ) if stage != 3 else engine.parameter_vector()
+        trainable_expected = torch.cat(
+            [parameter.detach().reshape(-1) for parameter in reference.parameters() if parameter.requires_grad]
+        )
+        torch.testing.assert_close(trainable_actual, trainable_expected, rtol=1e-6, atol=1e-7)

@@ -56,6 +56,7 @@ def _worker(
         )
 
         gradients_released = True
+        parameters_released = stage == 3
         # Two backwards before each step validate gradient accumulation. Each
         # rank receives different data, so collectives must average real DP gradients.
         for step in range(3):
@@ -68,9 +69,11 @@ def _worker(
                 engine.backward(loss)
                 if stage == 2:
                     gradients_released &= all(parameter.grad is None for parameter in model.parameters())
+                if stage == 3:
+                    parameters_released &= all(parameter.numel() == 0 for parameter in model.parameters())
             engine.step()
 
-        flat = torch.cat([parameter.detach().reshape(-1) for parameter in model.parameters()])
+        flat = engine.parameter_vector()
         replicas = [torch.empty_like(flat) for _ in range(world_size)]
         dist.all_gather(replicas, flat)
         for replica in replicas[1:]:
@@ -82,6 +85,7 @@ def _worker(
                     "parameters": flat,
                     "report": engine.report(),
                     "gradients_released": gradients_released,
+                    "parameters_released": parameters_released,
                 },
                 result_file,
             )
@@ -108,29 +112,37 @@ def test_zero_stages_match_stage_zero_for_one_two_and_four_ranks(world_size: int
         stage0 = _run_stage(0, world_size, root)
         stage1 = _run_stage(1, world_size, root)
         stage2 = _run_stage(2, world_size, root)
+        stage3 = _run_stage(3, world_size, root)
 
     total = stage0["parameters"].numel()
-    reports = {stage: result["report"] for stage, result in enumerate((stage0, stage1, stage2))}
+    reports = {stage: result["report"] for stage, result in enumerate((stage0, stage1, stage2, stage3))}
     assert total == 65
-    assert all(report.parameter_elements == total for report in reports.values())
+    assert all(reports[stage].parameter_elements == total for stage in (0, 1, 2))
 
     if world_size == 1:
         assert reports[0].optimizer_state_elements == reports[1].optimizer_state_elements
         assert reports[1].optimizer_state_elements == reports[2].optimizer_state_elements
+        assert reports[2].optimizer_state_elements == reports[3].optimizer_state_elements
         assert reports[0].gradient_elements == reports[2].gradient_elements
+        assert reports[2].gradient_elements == reports[3].gradient_elements
     else:
         assert reports[1].optimizer_state_elements < reports[0].optimizer_state_elements
         assert reports[2].optimizer_state_elements < reports[0].optimizer_state_elements
         assert reports[2].gradient_elements < reports[0].gradient_elements
+        assert reports[3].parameter_elements < reports[0].parameter_elements
+        assert reports[3].gradient_elements < reports[0].gradient_elements
+
+    assert reports[3].parameter_elements == (total + world_size - 1) // world_size
 
     # The 36, 9, 18, and 2 element tensors form four buckets with a 10 element
     # target. Per-bucket padding is intentionally reflected in the report.
     assert reports[2].gradient_bucket_count == 4
     assert reports[2].gradient_elements == sum((size + world_size - 1) // world_size for size in (36, 9, 18, 2))
     assert stage2["gradients_released"]
+    assert stage3["parameters_released"]
     assert "Gloo fallback" in reports[2].synchronization
 
-    for result in (stage1, stage2):
+    for result in (stage1, stage2, stage3):
         torch.testing.assert_close(result["parameters"], stage0["parameters"], rtol=1e-6, atol=1e-7)
 
 
@@ -141,8 +153,11 @@ def test_zero_stages_match_with_even_parameter_shards(world_size: int) -> None:
         stage0 = _run_stage(0, world_size, root, model_numel=64)
         stage1 = _run_stage(1, world_size, root, model_numel=64)
         stage2 = _run_stage(2, world_size, root, model_numel=64)
+        stage3 = _run_stage(3, world_size, root, model_numel=64)
 
     assert stage0["parameters"].numel() == 64
     assert stage2["report"].gradient_elements == 64 // world_size
-    for result in (stage1, stage2):
+    assert stage3["report"].parameter_elements == 64 // world_size
+    assert stage3["report"].gradient_elements == 64 // world_size
+    for result in (stage1, stage2, stage3):
         torch.testing.assert_close(result["parameters"], stage0["parameters"], rtol=1e-6, atol=1e-7)

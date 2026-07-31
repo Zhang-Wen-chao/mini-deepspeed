@@ -38,7 +38,7 @@ class ToyRegressor(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument("--zero-stage", type=int, choices=(0, 1, 2, 3), default=2)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     return parser.parse_args()

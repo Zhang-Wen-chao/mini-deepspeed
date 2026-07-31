@@ -9,6 +9,7 @@ temporary buffers, the persistent model-state accounting is:
 | Stage 0 | `P` parameters + `P` gradients + `2P` Adam = `4P` |
 | Stage 1 | `P` parameters + `P` gradients + `2P/N` Adam |
 | Stage 2 | `P` parameters + `P/N` gradients + `2P/N` Adam |
+| Stage 3 | `P/N` parameters + `P/N` gradients + `2P/N` Adam = `4P/N` |
 
 The implementation pads the final flat shard when `P` is not divisible by
 `N`. Stage 2 partitions complete parameter buckets, so its runtime
@@ -27,6 +28,24 @@ start from the same weights, matching DDP's initialization behavior.
 
 This is separate from model parallelism. TP and PP change which computation
 graph resides on a device. ZeRO changes which training states are stored there.
+
+## Stage-3 parameter lifecycle
+
+Stage 3 starts by broadcasting rank 0's complete vector once, then retains
+only each rank's padded parameter shard plus matching Adam state. An
+`engine.forward()` all-gathers those shards and makes every model parameter a
+view into the temporary flat vector. `engine.backward(loss)` checks that every
+trainable parameter participated, reduce-scatters the averaged gradient to its
+owner, and releases all complete parameter and gradient tensors. `step()`
+updates only the local parameter shard.
+
+This makes `P/N` parameter ownership observable between iterations. It is not
+production ZeRO-3 scheduling: the educational implementation gathers the
+entire model for every forward/backward pair, performs no prefetch or overlap,
+and does not release one layer before the next layer runs. Its API intentionally
+requires exactly one engine forward before each engine backward. A diagnostic
+`parameter_vector()` call gathers only a detached inspection copy; it does not
+change persistent ownership.
 
 ## Stage-2 bucket lifecycle
 
@@ -58,5 +77,5 @@ communication overlap; and a parameter larger than the configured bucket size
 remains a one-parameter bucket. The report measures retained state after the
 hook lifecycle, not the maximum allocator watermark. Allocator telemetry and
 more scheduling work are required before a physical peak-memory claim. ZeRO-3
-would additionally shard parameters and all-gather a layer only for its
-forward/backward use.
+does shard parameters here, but its full-model eager gather still prevents a
+layer-wise peak-memory claim.
