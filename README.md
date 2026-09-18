@@ -111,6 +111,100 @@ parameter iterable: it must enumerate all registered Parameters (including
 frozen ones) and buffers to reject hidden aliases safely. Stages 0-2 continue
 to accept a parameter iterable.
 
+## 代码导读（Code Walkthrough）
+
+上一节是 API 地图，这一节是从入口走到出口的那条线。所有锚点都是 `文件:行`（相对项目根）。
+
+### 入口清单：跑哪个，走的是哪条路
+
+| 命令 | 走的路径 | 入口锚点 |
+|---|---|---|
+| `python examples/train_toy.py --zero-stage 3` | 单进程/多进程训练一个 MLP，打印 `report()` | `mds.initialize(...)` → `train_toy.py:61`，训练循环 `train_toy.py:62` |
+| `torchrun ... examples/validate_equivalence.py` | 真实分布式下 ZeRO-1/2/3 与 Stage-0 基线逐 step 对比 | `run_stage(...)` → `validate_equivalence.py:54`，`main()` → `validate_equivalence.py:87` |
+| `python examples/compare_deepspeed.py` | 与官方 DeepSpeed 同模型同配置逐元素对比（需 CUDA + 隔离环境装 DeepSpeed） | `_run_mini(...)` → `compare_deepspeed.py:100`，`_run_deepspeed(...)` → `compare_deepspeed.py:162` |
+| `pytest` | 单进程 AdamW 等价 + 分布式 Gloo 等价 | `test_single_process.py:16`，`test_distributed.py:184` |
+
+一个贯穿全项目的设计点：**`engine.py` 整个文件只有 109 行**，`DeepSpeedEngine`
+（`engine.py:14`）的 `forward`/`backward`/`step`/`zero_grad` 四个 API 全部转发给
+`ZeroOptimizer`；真正的生命周期在 `zero.py`，分片数学全部收敛在 `layout.py`。
+换 stage 不换引擎——README 开头「What each stage owns」那张表，就是 `report()`
+（`zero.py:502`）按 stage 分支（`:504-518`）打印出来的数字。
+
+### 一条训练 step 的生命周期：讲代码就讲这条线
+
+```python
+engine = mds.initialize(model, {"zero_stage": 3, "lr": 1e-3})   # engine.py:98 → zero.py:75
+loss = loss_fn(engine(inputs), targets)                          # engine.py:30 → zero.py:178
+engine.backward(loss)                                            # engine.py:40 → zero.py:160
+engine.step()                                                    # engine.py:43 → zero.py:329
+engine.zero_grad()                                               # engine.py:46 → zero.py:141
+```
+
+`initialize` 建 `FlatParameterLayout`（`layout.py:21`）并广播 rank 0 的初始参数
+（`zero.py:220`）。之后每个 API 按 stage 分派，分派点都在 `zero.py`：
+
+| # | 动作 | 位置 | 干什么 |
+|---|---|---|---|
+| 1 | `forward` | `engine.py:30` → `zero.py:178` | 只有 Stage 3 做事：all-gather 分片 + `materialize` |
+| 2 | `backward` | `engine.py:40` → `zero.py:160` | 0/1 直接 `loss.backward()`；2 走 bucket hooks；3 走 `_backward_stage3` |
+| 3 | `step` | `engine.py:43` → `zero.py:329` | 0 all-reduce 全量；1 all-reduce + 分片；2/3 本地 shard AdamW + all-gather 回写 |
+| 4 | `zero_grad` | `engine.py:46` → `zero.py:141` | 清 `.grad`；2/3 额外重置分片累积窗口 |
+
+第 2、3 步往下按 stage 分三支，参数/梯度/优化器状态的流转是这条线的核心：
+
+```
+Stage 0/1   backward  loss.backward()                          zero.py:163
+            step      0: flatten → all-reduce → _adamw 全量    zero.py:330-339
+                      1: pad → all-reduce → local_shard → _adamw 分片
+                         → all-gather 回写                     zero.py:341-353
+Stage 2     backward  post-accumulate hook 逐桶触发            zero.py:258 → :305
+                      → pad → reduce-scatter → 留 shard → 清 param.grad
+            step      逐桶 local_shard → _adamw → all-gather 回写  zero.py:361-393
+Stage 3     forward   all-gather → materialize（参数变 view）   zero.py:188-189
+            backward  loss.backward → pad → reduce-scatter → release  zero.py:420-450
+            step      只更新本地 shard，无通信                  zero.py:462-467
+```
+
+三个落在这条线上的设计点，适合主动展开：
+
+- **分片数学只有五个操作**（`layout.py`）：`pad`（`:136`）/`local_shard`（`:143`）/
+  `assign`（`:148`）/`materialize`（`:162`）/`release`（`:171`）。padding 只用于
+  通信，`assign` 丢弃 padding；`shard_numel = ceil(numel / world_size)`
+  （`layout.py:53`）。所有 stage 的参数/梯度流转都只是这五个操作的排列组合。
+- **Stage 2 的通信发生在 autograd 内部**：`register_post_accumulate_grad_hook`
+  （`zero.py:258`）在桶内最后一个参数梯度就绪时立即 reduce-scatter 并清空完整
+  `param.grad`（`zero.py:321-327`）——这是与"step 边界才通信"的第一版的关键区别，
+  也是 README「Verification included」里"hook 清空完整梯度"断言的代码落点
+  （`test_distributed.py:85-86`）。
+- **Stage 3 的 materialize/release 边界**：参数在 forward 前 all-gather 成临时向量的
+  view（`layout.py:162`），backward 后 release 成空 tensor（`layout.py:171`）。
+  `parameter_vector()`（`zero.py:211`）是诊断用的临时 gather，不改变持久所有权。
+  README「Small API」里"one forward must be followed by one backward"的约束就是
+  `prepare_forward` 的 `_stage3_parameters_materialized` 检查（`zero.py:182`）。
+
+### 可替换边界
+
+- **优化器算法**：`_adamw`（`zero.py:531`）是唯一的优化器实现，四个 stage 共用。
+- **通信原语**：`_reduce_scatter_mean`（`zero.py:564`）是唯一的梯度通信（NCCL
+  native `reduce_scatter_tensor` / Gloo all-reduce+slice fallback，`zero.py:571-578`）；
+  `_all_gather_shards`（`zero.py:588`）是唯一的参数通信。换通信后端只改这两处。
+- **失败协调**：`_synchronize_stage3_failure`（`zero.py:490`）用 all-reduce MAX 把
+  rank-local 失败变成协调失败，避免一卡 raise 而其他卡阻塞在后续 collective。
+- **Stage 3 的 checkpoint 拒绝**：`engine.py:60-95` 在引擎、模块、每个子模块上注册
+  `state_dict` pre-hook（`engine.py:26-28`），保证分片空占位符永远不会被序列化。
+
+### 阅读顺序
+
+```
+1. examples/train_toy.py     先跑一遍，建立"谁在驱动谁"的整体印象
+2. engine.py                 109 行薄壳，四个 API 全部转发
+3. layout.py                 FlatParameterLayout：五个操作覆盖所有分片流转
+4. zero.py:329 step()        按 stage 分派的主干
+5. zero.py:305 / :395        Stage 2 bucket hook 与 Stage 3 backward 两条支线
+6. tests/                    单进程 AdamW 等价 + 分布式 Gloo 等价
+7. examples/validate_equivalence.py / compare_deepspeed.py   真实分布式与官方参考
+```
+
 ## Run locally
 
 Requires Python 3.10+ and PyTorch 2.1+.
